@@ -2,6 +2,7 @@ export const TOOL_MODES = {
   PAN: "pan",
   TEE: "tee",
   GREEN: "green",
+  GREEN_AREA: "green_area",
   FAIRWAY: "fairway",
   BUNKER: "bunker",
   WATER: "water",
@@ -11,6 +12,7 @@ export const TOOL_MODES = {
 export const TOOL_COLORS = {
   [TOOL_MODES.TEE]: "#e74c3c",
   [TOOL_MODES.GREEN]: "#2ecc71",
+  [TOOL_MODES.GREEN_AREA]: "#27ae60",
   [TOOL_MODES.FAIRWAY]: "#7dcea0",
   [TOOL_MODES.BUNKER]: "#f0e68c",
   [TOOL_MODES.WATER]: "#3498db",
@@ -20,7 +22,8 @@ export const TOOL_COLORS = {
 export const TOOL_LABELS = {
   [TOOL_MODES.PAN]: "Pan / Select",
   [TOOL_MODES.TEE]: "Tee Box",
-  [TOOL_MODES.GREEN]: "Green",
+  [TOOL_MODES.GREEN]: "Pin Placement",
+  [TOOL_MODES.GREEN_AREA]: "Green Area",
   [TOOL_MODES.FAIRWAY]: "Fairway",
   [TOOL_MODES.BUNKER]: "Bunker",
   [TOOL_MODES.WATER]: "Water Hazard",
@@ -31,6 +34,7 @@ export const TOOL_ICONS = {
   [TOOL_MODES.PAN]: "↔",
   [TOOL_MODES.TEE]: "⏏",
   [TOOL_MODES.GREEN]: "⚑",
+  [TOOL_MODES.GREEN_AREA]: "⊙",
   [TOOL_MODES.FAIRWAY]: "▬",
   [TOOL_MODES.BUNKER]: "◌",
   [TOOL_MODES.WATER]: "〜",

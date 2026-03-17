@@ -22,6 +22,10 @@ export default defineConfig({
         target: "http://localhost:3001",
         changeOrigin: true,
       },
+      "/launch-monitor": {
+        target: "ws://localhost:3001",
+        ws: true,
+      },
       "/nominatim": {
         target: "https://nominatim.openstreetmap.org",
         changeOrigin: true,

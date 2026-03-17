@@ -1,12 +1,16 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as THREE from "three";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import JSZip from "jszip";
+import GameView from "./src/GameView.jsx";
+// Note: golf-course-creator.jsx lives in project root; GameView.jsx is in src/
 
 const TOOL_MODES = {
   PAN: "pan",
   TEE: "tee",
   GREEN: "green",
+  GREEN_AREA: "green_area",
   FAIRWAY: "fairway",
   BUNKER: "bunker",
   WATER: "water",
@@ -16,6 +20,7 @@ const TOOL_MODES = {
 const TOOL_COLORS = {
   [TOOL_MODES.TEE]: "#e74c3c",
   [TOOL_MODES.GREEN]: "#2ecc71",
+  [TOOL_MODES.GREEN_AREA]: "#27ae60",
   [TOOL_MODES.FAIRWAY]: "#7dcea0",
   [TOOL_MODES.BUNKER]: "#f0e68c",
   [TOOL_MODES.WATER]: "#3498db",
@@ -25,7 +30,8 @@ const TOOL_COLORS = {
 const TOOL_LABELS = {
   [TOOL_MODES.PAN]: "Pan / Select",
   [TOOL_MODES.TEE]: "Tee Box",
-  [TOOL_MODES.GREEN]: "Green",
+  [TOOL_MODES.GREEN]: "Pin Placement",
+  [TOOL_MODES.GREEN_AREA]: "Green Area",
   [TOOL_MODES.FAIRWAY]: "Fairway",
   [TOOL_MODES.BUNKER]: "Bunker",
   [TOOL_MODES.WATER]: "Water Hazard",
@@ -36,6 +42,7 @@ const TOOL_ICONS = {
   [TOOL_MODES.PAN]: "↔",
   [TOOL_MODES.TEE]: "⏏",
   [TOOL_MODES.GREEN]: "⚑",
+  [TOOL_MODES.GREEN_AREA]: "⊙",
   [TOOL_MODES.FAIRWAY]: "▬",
   [TOOL_MODES.BUNKER]: "◌",
   [TOOL_MODES.WATER]: "〜",
@@ -62,6 +69,58 @@ function calcDistance(p1, p2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 1.09361;
 }
 
+// Fetch and stitch ArcGIS satellite tiles for a lat/lng bounding box.
+// Returns a canvas whose pixel extent exactly matches the bounds.
+async function fetchSatelliteTexture(bounds) {
+  const { north, south, east, west } = bounds;
+
+  // Pick zoom so we get ~4 tiles across (capped 13–17)
+  const idealZoom = Math.round(Math.log2(4 * 360 / (east - west)));
+  const zoom = Math.max(13, Math.min(17, idealZoom));
+  const scale = Math.pow(2, zoom);
+
+  const lngToTx  = lng => Math.floor((lng + 180) / 360 * scale);
+  const latToTy  = lat => Math.floor(
+    (1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * scale
+  );
+  const lngToPx  = lng => ((lng + 180) / 360 * scale - minTx) * 256;
+  const latToPy  = lat =>
+    ((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * scale - minTy) * 256;
+
+  const minTx = lngToTx(west),  maxTx = lngToTx(east);
+  const minTy = latToTy(north), maxTy = latToTy(south); // north → smaller ty
+
+  // Stitch all tiles onto one canvas
+  const stitchW = (maxTx - minTx + 1) * 256;
+  const stitchH = (maxTy - minTy + 1) * 256;
+  const stitchCanvas = document.createElement("canvas");
+  stitchCanvas.width  = stitchW;
+  stitchCanvas.height = stitchH;
+  const sCtx = stitchCanvas.getContext("2d");
+
+  await Promise.all(
+    Array.from({ length: maxTx - minTx + 1 }, (_, i) => minTx + i).flatMap(tx =>
+      Array.from({ length: maxTy - minTy + 1 }, (_, j) => minTy + j).map(ty =>
+        new Promise(resolve => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => { sCtx.drawImage(img, (tx - minTx) * 256, (ty - minTy) * 256, 256, 256); resolve(); };
+          img.onerror = resolve;
+          img.src = `/tiles/${zoom}/${ty}/${tx}`;
+        })
+      )
+    )
+  );
+
+  // Crop to exact bounds and render to a 1024×1024 output canvas
+  const cropX = lngToPx(west),  cropW = lngToPx(east)  - cropX;
+  const cropY = latToPy(north), cropH = latToPy(south) - cropY;
+  const out = document.createElement("canvas");
+  out.width = out.height = 1024;
+  out.getContext("2d").drawImage(stitchCanvas, cropX, cropY, cropW, cropH, 0, 0, 1024, 1024);
+  return out;
+}
+
 // Elevation colour gradient: flat green → mid green → tan → light grey
 function elevationColor(t) {
   const stops = [
@@ -82,24 +141,219 @@ function elevationColor(t) {
   return [0.82, 0.80, 0.76];
 }
 
-function TerrainPreview({ objText, courseName, onClose }) {
-  const mountRef = useRef(null);
+function TerrainPreview({ objText, bounds, courseJson, courseName, onClose, onPlay }) {
+  // onPlay(trees) — called with the current visibleTrees array
+  const mountRef  = useRef(null);
+  const sceneRef  = useRef(null);
+  const [texStatus, setTexStatus]           = useState("loading");
+  const [filteredTrees, setFilteredTrees]   = useState([]); // all satellite-detected trees
+  const [deletedIndices, setDeletedIndices] = useState(() => new Set()); // manually removed
+  const [roughType, setRoughType]           = useState("long_rough");
+  const [treeDensity, setTreeDensity]       = useState(1.0); // 100% by default
 
-  const download = () => {
-    const blob = new Blob([objText], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
+  const slug = courseName.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+
+  const ROUGH_TYPES = [
+    { value: "long_rough", label: "Long Rough"  },
+    { value: "fescue",     label: "Fescue"       },
+    { value: "pinestraw",  label: "Pine Straw"   },
+    { value: "bermuda",    label: "Bermuda"       },
+    { value: "bluegrass",  label: "Bluegrass"    },
+  ];
+
+  // Deterministic shuffle using a fixed seed so density slider gives stable results
+  function seededShuffle(arr) {
+    const out = arr.map((t, i) => ({ t, i }));
+    let s = 0x12345678;
+    for (let i = out.length - 1; i > 0; i--) {
+      s = Math.imul(s, 1664525) + 1013904223 | 0;
+      const j = Math.abs(s) % (i + 1);
+      [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+  }
+
+  // Density-sliced, manually-deleted-filtered tree list
+  const visibleTrees = useMemo(() => {
+    const count = Math.round(treeDensity * filteredTrees.length);
+    return seededShuffle(filteredTrees).slice(0, count).filter(({ i }) => !deletedIndices.has(i));
+  }, [filteredTrees, treeDensity, deletedIndices]);
+
+  // Detect trees from satellite imagery using drawn fairway polygons as a colour baseline.
+  // Samples pixels inside the fairway polygons to get the average turf colour, then
+  // finds clusters of pixels that are significantly darker — tree canopy.
+  function detectTreesFromSatellite(texCanvas, b, cJson) {
+    const { north, south, east, west } = b;
+    const W = texCanvas.width, H = texCanvas.height;
+    const { data } = texCanvas.getContext("2d").getImageData(0, 0, W, H);
+
+    const toPixel = (lat, lng) => ({
+      px: ((lng - west)  / (east  - west )) * (W - 1),
+      py: ((north - lat) / (north - south)) * (H - 1),
+    });
+
+    // Ray-cast point-in-polygon (pixel space)
+    function inPoly(px, py, poly) {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i].px, yi = poly[i].py, xj = poly[j].px, yj = poly[j].py;
+        if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
+          inside = !inside;
+      }
+      return inside;
+    }
+
+    // Build pixel-space fairway and water polygons from drawn features
+    const fairwayPolys = [];
+    const waterPolys   = [];
+    for (const hole of (cJson?.holes || [])) {
+      for (const feat of (hole.features || [])) {
+        if (feat.type === "fairway" || feat.type === "green_area")
+          fairwayPolys.push(feat.points.map(p => toPixel(p.lat, p.lng)));
+        else if (feat.type === "water")
+          waterPolys.push(feat.points.map(p => toPixel(p.lat, p.lng)));
+      }
+    }
+
+    // Helper: sample pixels inside a set of polygons
+    function samplePolys(polys) {
+      let sR = 0, sG = 0, sB = 0, cnt = 0;
+      const S = 5;
+      for (const poly of polys) {
+        const minPx = Math.max(0, Math.floor(Math.min(...poly.map(p => p.px))));
+        const maxPx = Math.min(W - 1, Math.ceil(Math.max(...poly.map(p => p.px))));
+        const minPy = Math.max(0, Math.floor(Math.min(...poly.map(p => p.py))));
+        const maxPy = Math.min(H - 1, Math.ceil(Math.max(...poly.map(p => p.py))));
+        for (let py = minPy; py <= maxPy; py += S) {
+          for (let px = minPx; px <= maxPx; px += S) {
+            if (inPoly(px, py, poly)) {
+              const i = (py * W + px) * 4;
+              sR += data[i]; sG += data[i + 1]; sB += data[i + 2];
+              cnt++;
+            }
+          }
+        }
+      }
+      return cnt > 0 ? { r: sR / cnt, g: sG / cnt, b: sB / cnt, cnt } : null;
+    }
+
+    // Fairway baseline (fallback to sensible defaults if no polygons)
+    const fwSample = samplePolys(fairwayPolys);
+    const baseR   = fwSample ? fwSample.r : 100;
+    const baseG   = fwSample ? fwSample.g : 150;
+    const baseB   = fwSample ? fwSample.b : 70;
+    const baseSum = baseR + baseG + baseB;
+    console.log(`Fairway baseline (${fwSample?.cnt ?? 0} samples): R=${baseR.toFixed(0)} G=${baseG.toFixed(0)} B=${baseB.toFixed(0)} sum=${baseSum.toFixed(0)}`);
+
+    // Water baseline — used to reject water-tinted pixels from tree detection
+    const wSample = samplePolys(waterPolys);
+    // Water G/B ratio: pixels that look like water (similar G/B ratio) are excluded
+    const waterGBRatio = wSample && wSample.b > 10 ? wSample.g / wSample.b : null;
+    if (waterGBRatio !== null)
+      console.log(`Water baseline (${wSample.cnt} samples): R=${wSample.r.toFixed(0)} G=${wSample.g.toFixed(0)} B=${wSample.b.toFixed(0)} G/B=${waterGBRatio.toFixed(2)}`);
+
+    // A pixel qualifies as tree canopy if it is:
+    //   - green-dominant (more green than red or blue)
+    //   - significantly darker than the fairway baseline
+    //   - G/B ratio is sufficiently higher than water's (eliminates water tint)
+    const DARK_RATIO = 0.72; // canopy must be <72% of fairway brightness
+    function isTreeGreen(px, py) {
+      if (px < 0 || px >= W || py < 0 || py >= H) return false;
+      const i = (py * W + px) * 4;
+      const r = data[i], g = data[i + 1], bv = data[i + 2];
+      const sum = r + g + bv;
+      if (!(g > r * 1.03 && g > bv * 1.05 && sum < baseSum * DARK_RATIO && g < baseG * DARK_RATIO)) return false;
+      // Reject pixels whose G/B ratio resembles water (water tint removal)
+      if (waterGBRatio !== null && bv > 5) {
+        const pixGBRatio = g / bv;
+        if (pixGBRatio < waterGBRatio * 1.1) return false;
+      }
+      return true;
+    }
+
+    const STEP    = 8;  // sample every 8 px
+    const WIN     = 3;  // ±3 px neighbourhood = 7×7 = 49 pixels
+    const MIN_GRN = 28; // 28/49 pixels must qualify (dense canopy patch)
+    const MIN_SEP = 28; // min pixel gap between trees
+
+    const candidates = [];
+    for (let py = WIN; py < H - WIN; py += STEP) {
+      for (let px = WIN; px < W - WIN; px += STEP) {
+        // Skip pixels inside any water polygon
+        if (waterPolys.some(poly => inPoly(px, py, poly))) continue;
+        let greenCount = 0;
+        for (let dy = -WIN; dy <= WIN; dy++)
+          for (let dx = -WIN; dx <= WIN; dx++)
+            if (isTreeGreen(px + dx, py + dy)) greenCount++;
+        if (greenCount >= MIN_GRN) candidates.push({ px, py });
+      }
+    }
+
+    // Non-max suppression — first-come first-served at MIN_SEP spacing
+    const kept = [];
+    for (const c of candidates) {
+      let tooClose = false;
+      for (const k of kept) {
+        const dx = c.px - k.px, dy = c.py - k.py;
+        if (dx * dx + dy * dy < MIN_SEP * MIN_SEP) { tooClose = true; break; }
+      }
+      if (!tooClose) kept.push(c);
+    }
+
+    return kept.map(({ px, py }) => ({
+      lat: north - (py / (H - 1)) * (north - south),
+      lng: west  + (px / (W - 1)) * (east  - west),
+      heightAboveGround: 10,
+    }));
+  }
+
+  const downloadZip = async () => {
+    if (texStatus !== "ready" || !sceneRef.current?.textureCanvas) return;
+    const texCanvas = sceneRef.current.textureCanvas;
+    const zip = new JSZip();
+
+    // OBJ with embedded material reference
+    const mtlName = `${slug}_terrain.mtl`;
+    zip.file(`${slug}_terrain.obj`, `mtllib ${mtlName}\nusemtl terrain_mat\n\n${objText}`);
+
+    // MTL
+    zip.file(mtlName, [
+      `# Material for ${courseName} terrain`,
+      `newmtl terrain_mat`,
+      `Ka 1.0 1.0 1.0`,
+      `Kd 1.0 1.0 1.0`,
+      `Ks 0.0 0.0 0.0`,
+      `map_Kd ${slug}_terrain.jpg`,
+    ].join("\n"));
+
+    // Satellite texture
+    const texBlob = await new Promise(res => texCanvas.toBlob(res, "image/jpeg", 0.92));
+    zip.file(`${slug}_terrain.jpg`, texBlob);
+
+    // Course data JSON consumed by CourseForgeImporter.cs in Unity
+    const courseData = {
+      ...(courseJson || {}),
+      bounds,
+      roughType,
+      treeDensity,
+      detectedTrees: visibleTrees.map(({ t }) => t),
+    };
+    zip.file(`${slug}_course_data.json`, JSON.stringify(courseData, null, 2));
+
+    const zipBlob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(zipBlob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${courseName.replace(/\s+/g, "_").toLowerCase()}_terrain.obj`;
+    a.download = `${slug}_terrain.zip`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  // Set up Three.js scene
   useEffect(() => {
     if (!objText || !mountRef.current) return;
     const el = mountRef.current;
-    const w = el.clientWidth;
-    const h = el.clientHeight;
+    const w = el.clientWidth, h = el.clientHeight;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
@@ -108,8 +362,8 @@ function TerrainPreview({ objText, courseName, onClose }) {
     el.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
-    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
     sun.position.set(1, 2, 1.5);
     scene.add(sun);
 
@@ -118,21 +372,18 @@ function TerrainPreview({ objText, courseName, onClose }) {
     controls.enableDamping = true;
 
     const obj = new OBJLoader().parse(objText);
+    // X is pre-negated in the OBJ for Unity compatibility; no scale correction needed —
+    // with camera looking in +Z (north), the camera's right vector is -X, so east at -X appears correctly on the right.
 
-    // Compute Y range for colour mapping
+    // Vertex colours while texture loads
     let minY = Infinity, maxY = -Infinity;
     obj.traverse(child => {
       if (!child.isMesh) return;
       const pos = child.geometry.attributes.position;
-      for (let i = 0; i < pos.count; i++) {
-        const y = pos.getY(i);
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
+      for (let i = 0; i < pos.count; i++) { const y = pos.getY(i); if (y < minY) minY = y; if (y > maxY) maxY = y; }
     });
     const yRange = maxY - minY || 1;
-
-    // Apply vertex colours
+    const meshes = [];
     obj.traverse(child => {
       if (!child.isMesh) return;
       const pos = child.geometry.attributes.position;
@@ -142,17 +393,20 @@ function TerrainPreview({ objText, courseName, onClose }) {
         colArr[i * 3] = r; colArr[i * 3 + 1] = g; colArr[i * 3 + 2] = b;
       }
       child.geometry.setAttribute("color", new THREE.BufferAttribute(colArr, 3));
-      child.material = new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 10 });
+      child.material = new THREE.MeshPhongMaterial({ vertexColors: true, shininess: 5, side: THREE.DoubleSide });
+      meshes.push(child);
     });
 
+    const treeGroup = new THREE.Group();
     scene.add(obj);
+    scene.add(treeGroup);
+    sceneRef.current = { meshes, textureCanvas: null, treeGroup, scene, camera };
 
-    // Frame camera on mesh
     const box = new THREE.Box3().setFromObject(obj);
     const centre = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const span = Math.max(size.x, size.z);
-    camera.position.set(centre.x, centre.y + span * 0.7, centre.z + span * 1.1);
+    const size   = box.getSize(new THREE.Vector3());
+    const span   = Math.max(size.x, size.z);
+    camera.position.set(centre.x, centre.y + span * 0.7, centre.z - span * 1.1);
     camera.lookAt(centre);
     controls.target.copy(centre);
     controls.update();
@@ -161,44 +415,176 @@ function TerrainPreview({ objText, courseName, onClose }) {
     const animate = () => { animId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); };
     animate();
 
+    // Click a tree to remove it
+    const onClick = (e) => {
+      const ref = sceneRef.current;
+      if (!ref) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mouse = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width)  *  2 - 1,
+        ((e.clientY - rect.top)  / rect.height) * -2 + 1
+      );
+      const rc = new THREE.Raycaster();
+      rc.setFromCamera(mouse, ref.camera);
+      const hits = rc.intersectObjects(ref.treeGroup.children, true);
+      if (!hits.length) return;
+      // Walk up to the Group that has treeIdx
+      let obj = hits[0].object;
+      while (obj && obj.userData.treeIdx === undefined) obj = obj.parent;
+      if (obj?.userData.treeIdx !== undefined) {
+        setDeletedIndices(prev => { const next = new Set(prev); next.add(obj.userData.treeIdx); return next; });
+      }
+    };
+    renderer.domElement.addEventListener("click", onClick);
+
+    fetchSatelliteTexture(bounds).then(texCanvas => {
+      if (!sceneRef.current) return;
+      const texture = new THREE.CanvasTexture(texCanvas);
+      texture.flipY = true;
+      sceneRef.current.meshes.forEach(mesh => {
+        mesh.material.dispose();
+        mesh.material = new THREE.MeshPhongMaterial({ map: texture, shininess: 5, side: THREE.DoubleSide });
+      });
+      sceneRef.current.textureCanvas = texCanvas;
+      setFilteredTrees(detectTreesFromSatellite(texCanvas, bounds, courseJson));
+      setTexStatus("ready");
+    }).catch(() => setTexStatus("error"));
+
     const onResize = () => {
       if (!el) return;
       const nw = el.clientWidth, nh = el.clientHeight;
-      camera.aspect = nw / nh;
-      camera.updateProjectionMatrix();
-      renderer.setSize(nw, nh);
+      camera.aspect = nw / nh; camera.updateProjectionMatrix(); renderer.setSize(nw, nh);
     };
     window.addEventListener("resize", onResize);
 
     return () => {
       cancelAnimationFrame(animId);
       window.removeEventListener("resize", onResize);
+      renderer.domElement.removeEventListener("click", onClick);
       controls.dispose();
       renderer.dispose();
+      sceneRef.current = null;
       if (el.contains(renderer.domElement)) el.removeChild(renderer.domElement);
     };
-  }, [objText]);
+  }, [objText, bounds]);
+
+  // Rebuild tree meshes whenever visibility changes (density, deletions, or new detections)
+  useEffect(() => {
+    const ref = sceneRef.current;
+    if (!ref?.treeGroup) return;
+    const { treeGroup, meshes } = ref;
+
+    // Clear old meshes
+    while (treeGroup.children.length > 0) {
+      const c = treeGroup.children[0];
+      c.geometry?.dispose();
+      treeGroup.remove(c);
+    }
+
+    if (!visibleTrees.length) return;
+
+    const { north, south, east, west } = bounds;
+    const centerLat = (north + south) / 2;
+    const centerLon = (east + west) / 2;
+    const mPerLon = 111320 * Math.cos(centerLat * Math.PI / 180);
+    const toXZ = (lat, lng) => ({
+      x: -(lng - centerLon) * 111320 * Math.cos(centerLat * Math.PI / 180), // negated to match OBJ export
+      z: (lat - centerLat) * 110540,
+    });
+
+    const raycaster = new THREE.Raycaster();
+    const down = new THREE.Vector3(0, -1, 0);
+    const trunkMat  = new THREE.MeshPhongMaterial({ color: 0x6b4226 });
+    const canopyMat = new THREE.MeshPhongMaterial({ color: 0x2d6a2d });
+
+    for (const { t, i } of visibleTrees) {
+      const { x, z } = toXZ(t.lat, t.lng);
+      const treeH = Math.max((t.heightAboveGround || 1) * 6, 12);
+
+      raycaster.set(new THREE.Vector3(x, 99999, z), down);
+      const hits = raycaster.intersectObjects(meshes, true);
+      const groundY = hits.length > 0 ? hits[0].point.y : 0;
+
+      const trunkH = treeH * 0.35, canopyH = treeH * 0.75, canopyR = treeH * 0.45;
+
+      const group = new THREE.Group();
+      group.userData.treeIdx = i;
+
+      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(canopyR * 0.18, canopyR * 0.22, trunkH, 6), trunkMat);
+      trunk.position.set(x, groundY + trunkH / 2, z);
+
+      const canopy = new THREE.Mesh(new THREE.ConeGeometry(canopyR, canopyH, 7), canopyMat);
+      canopy.position.set(x, groundY + trunkH + canopyH / 2, z);
+
+      group.add(trunk, canopy);
+      treeGroup.add(group);
+    }
+  }, [visibleTrees]);
 
   return (
-    <div style={{
-      position: "absolute", inset: 0, zIndex: 30,
-      display: "flex", flexDirection: "column", background: "#0d1117",
-    }}>
+    <div style={{ position: "absolute", inset: 0, zIndex: 30, display: "flex", flexDirection: "column", background: "#0d1117" }}>
       <div style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
-        padding: "10px 16px", background: "#161b22", borderBottom: "1px solid #30363d",
-        flexShrink: 0,
+        padding: "10px 16px", background: "#161b22", borderBottom: "1px solid #30363d", flexShrink: 0,
       }}>
         <span style={{ fontFamily: "Outfit", fontWeight: 700, fontSize: 15, color: "#e8e6e3" }}>
           ⛰ Terrain Preview
         </span>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={download} style={{
-            background: "linear-gradient(135deg, #1f6feb 0%, #388bfd 100%)",
-            border: "none", borderRadius: 6, color: "#fff",
-            padding: "6px 14px", cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit",
-          }}>
-            ↓ Download OBJ
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ fontSize: 11, color: "#8b949e" }}>Rough</label>
+          <select
+            value={roughType}
+            onChange={e => setRoughType(e.target.value)}
+            style={{
+              background: "#21262d", border: "1px solid #30363d", borderRadius: 5,
+              color: "#c9d1d9", padding: "4px 6px", fontSize: 11, fontFamily: "inherit",
+            }}
+          >
+            {ROUGH_TYPES.map(rt => <option key={rt.value} value={rt.value}>{rt.label}</option>)}
+          </select>
+          <label style={{ fontSize: 11, color: "#8b949e" }}>
+            Trees {Math.round(treeDensity * 100)}%
+          </label>
+          <input
+            type="range" min={0} max={1} step={0.05} value={treeDensity}
+            onChange={e => setTreeDensity(+e.target.value)}
+            style={{ width: 70, accentColor: "#388bfd" }}
+          />
+          {texStatus === "ready" && (
+            <span style={{
+              fontSize: 11, color: "#58a6ff", background: "#0d2846",
+              border: "1px solid #1f6feb", borderRadius: 4, padding: "2px 7px",
+            }}>
+              🌲 {visibleTrees.length} / {filteredTrees.length}
+            </span>
+          )}
+          <button
+            onClick={downloadZip}
+            disabled={texStatus !== "ready"}
+            style={{
+              background: texStatus === "ready"
+                ? "linear-gradient(135deg, #1f6feb 0%, #388bfd 100%)" : "#21262d",
+              border: "none", borderRadius: 6,
+              color: texStatus === "ready" ? "#fff" : "#8b949e",
+              padding: "6px 14px", cursor: texStatus === "ready" ? "pointer" : "default",
+              fontSize: 12, fontWeight: 600, fontFamily: "inherit",
+            }}
+          >
+            {texStatus === "loading" ? "⏳ Loading…" : "↓ Download ZIP"}
+          </button>
+          <button
+            onClick={() => onPlay?.(visibleTrees.map(({ t }) => t))}
+            disabled={texStatus !== "ready"}
+            style={{
+              background: texStatus === "ready"
+                ? "linear-gradient(135deg, #1a7f37 0%, #2ea043 100%)" : "#21262d",
+              border: "none", borderRadius: 6,
+              color: texStatus === "ready" ? "#fff" : "#8b949e",
+              padding: "6px 14px", cursor: texStatus === "ready" ? "pointer" : "default",
+              fontSize: 12, fontWeight: 600, fontFamily: "inherit",
+            }}
+          >
+            ▶ Play Course
           </button>
           <button onClick={onClose} style={{
             background: "#21262d", border: "1px solid #30363d", borderRadius: 6,
@@ -208,15 +594,17 @@ function TerrainPreview({ objText, courseName, onClose }) {
           </button>
         </div>
       </div>
-      <div style={{ flex: 1, fontSize: 11, color: "#8b949e", padding: "6px 16px", background: "#161b22", borderBottom: "1px solid #21262d", flexShrink: 0 }}>
+      <div style={{ fontSize: 11, color: "#8b949e", padding: "5px 16px", background: "#161b22", borderBottom: "1px solid #21262d", flexShrink: 0, whiteSpace: "nowrap", overflow: "hidden" }}>
         Drag to orbit · Scroll to zoom · Right-drag to pan
+        {texStatus === "loading" && <span style={{ marginLeft: 12, color: "#58a6ff" }}>· Fetching satellite texture…</span>}
+        {texStatus === "ready" && visibleTrees.length > 0 && <span style={{ marginLeft: 12, color: "#3fb950" }}>· Click a tree to remove it</span>}
       </div>
-      <div ref={mountRef} style={{ flex: 1 }} />
+      <div ref={mountRef} style={{ flex: 1, minHeight: 0 }} />
     </div>
   );
 }
 
-function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMarkerClick, onMarkerDrag, onPolyNodeDrag, onRightClick, polygons, overlay, onOverlayMove }) {
+function MapCanvas({ center, zoom, markers, activeHole, activePolygon, tool, onMapClick, onMarkerClick, onMarkerDrag, onPolyNodeDrag, onPolyNodeClick, onRightClick, polygons, overlay, onOverlayMove }) {
   const canvasRef = useRef(null);
   const stateRef = useRef({ dragging: false, lastPos: null, offset: { x: 0, y: 0 } });
   const spaceRef = useRef(false); // spacebar held for temp pan
@@ -226,9 +614,15 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
   // dragState: { kind:'marker', marker, pixel } | { kind:'poly', polyIndex, pointIndex, pixel }
   const [dragState, setDragState] = useState(null);
 
+  // Navigate to a new course location — only resets center when center prop changes
   useEffect(() => {
-    setViewState(v => ({ ...v, center, zoom }));
-  }, [center, zoom]);
+    setViewState(v => ({ ...v, center }));
+  }, [center]);
+
+  // Keep zoom in sync with parent zoom buttons without resetting the panned position
+  useEffect(() => {
+    setViewState(v => ({ ...v, zoom }));
+  }, [zoom]);
 
   useEffect(() => {
     const el = canvasRef.current?.parentElement;
@@ -331,9 +725,15 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    canvas.width = canvasSize.w;
-    canvas.height = canvasSize.h;
+    // Only reset canvas buffer when the physical size changes — avoids
+    // clearing to white on every drag/state update
+    if (canvas.width !== canvasSize.w || canvas.height !== canvasSize.h) {
+      canvas.width = canvasSize.w;
+      canvas.height = canvasSize.h;
+    }
     const ctx = canvas.getContext("2d");
+    ctx.setLineDash([]);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     ctx.fillStyle = "#1a2332";
     ctx.fillRect(0, 0, canvasSize.w, canvasSize.h);
@@ -343,12 +743,25 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
     const cx = ((viewState.center.lng + 180) / 360) * scale;
     const cy = ((1 - Math.log(Math.tan((viewState.center.lat * Math.PI) / 180) + 1 / Math.cos((viewState.center.lat * Math.PI) / 180)) / Math.PI) / 2) * scale;
 
-    Object.values(tileImages).forEach(({ img, tx, ty, z: tz }) => {
+    const brokenKeys = [];
+    Object.entries(tileImages).forEach(([key, { img, tx, ty, z: tz }]) => {
       if (tz !== z) return;
       const px = tx * 256 - cx + canvasSize.w / 2 + viewState.offset.x;
       const py = ty * 256 - cy + canvasSize.h / 2 + viewState.offset.y;
-      ctx.drawImage(img, px, py, 256, 256);
+      try {
+        ctx.drawImage(img, px, py, 256, 256);
+      } catch {
+        // Image evicted from browser memory — remove so it reloads on next render
+        brokenKeys.push(key);
+      }
     });
+    if (brokenKeys.length > 0) {
+      setTileImages(prev => {
+        const next = { ...prev };
+        brokenKeys.forEach(k => delete next[k]);
+        return next;
+      });
+    }
 
     // Draw course map overlay
     if (overlay?.img?.complete) {
@@ -369,35 +782,49 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
       ctx.restore();
     }
 
-    // Draw polygons (fairways, bunkers, water)
+    // Draw polygons (fairways, bunkers, water, paths)
     polygons.forEach((poly, pi) => {
-      if (poly.points.length < 2) return;
-      ctx.beginPath();
+      const color = TOOL_COLORS[poly.type] || "#fff";
       const pts = poly.points.map((p, ni) => {
         if (dragState?.kind === "poly" && dragState.polyIndex === pi && dragState.pointIndex === ni) {
           return dragState.pixel;
         }
         return latlngToPixel(p.lat, p.lng, viewState.center, viewState.zoom, viewState.offset);
       });
-      ctx.moveTo(pts[0].x, pts[0].y);
-      pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
-      if (poly.closed) ctx.closePath();
-      const color = TOOL_COLORS[poly.type] || "#fff";
-      ctx.fillStyle = color + "44";
-      ctx.fill();
-      ctx.strokeStyle = color + "cc";
-      ctx.lineWidth = 2;
-      ctx.stroke();
 
+      // Fill + stroke only once there are enough points to form a shape
+      if (pts.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+        if (poly.closed) ctx.closePath();
+        ctx.fillStyle = color + "44";
+        ctx.fill();
+        ctx.strokeStyle = color + "cc";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Node dots — always drawn so the first placed point is visible
+      const isActive = pi === activePolygon;
+      const canClose = isActive && poly.points.length >= 3;
       pts.forEach((p, ni) => {
         const isBeingDragged = dragState?.kind === "poly" && dragState.polyIndex === pi && dragState.pointIndex === ni;
+        const isCloseTarget = canClose && ni === 0;
+        const r = isBeingDragged ? 7 : isCloseTarget ? 7 : 4;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, isBeingDragged ? 7 : 4, 0, Math.PI * 2);
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
         ctx.fillStyle = isBeingDragged ? "#fff" : color;
         ctx.fill();
-        if (isBeingDragged) {
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 2;
+        ctx.strokeStyle = isBeingDragged ? color : isCloseTarget ? "#fff" : "rgba(0,0,0,0.5)";
+        ctx.lineWidth = isBeingDragged || isCloseTarget ? 2 : 1;
+        ctx.stroke();
+        // Outer ring on the close target to make it obvious
+        if (isCloseTarget) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, r + 4, 0, Math.PI * 2);
+          ctx.strokeStyle = color + "aa";
+          ctx.lineWidth = 1.5;
           ctx.stroke();
         }
       });
@@ -410,7 +837,8 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
         ? dragState.pixel
         : latlngToPixel(m.lat, m.lng, viewState.center, viewState.zoom, viewState.offset);
       const isActive = m.hole === activeHole;
-      const r = isActive ? 12 : 9;
+      const isPin = m.type === TOOL_MODES.GREEN;
+      const r = isPin ? (isActive ? 7 : 5) : (isActive ? 12 : 9);
       const color = TOOL_COLORS[m.type] || "#fff";
 
       ctx.beginPath();
@@ -449,8 +877,8 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
       const tee = markers.find(m => m.hole === h && m.type === TOOL_MODES.TEE);
       const green = markers.find(m => m.hole === h && m.type === TOOL_MODES.GREEN);
       if (tee && green) {
-        const teeDragged = dragState && dragState.marker.hole === h && dragState.marker.type === TOOL_MODES.TEE;
-        const greenDragged = dragState && dragState.marker.hole === h && dragState.marker.type === TOOL_MODES.GREEN;
+        const teeDragged = dragState?.kind === "marker" && dragState.marker.hole === h && dragState.marker.type === TOOL_MODES.TEE;
+        const greenDragged = dragState?.kind === "marker" && dragState.marker.hole === h && dragState.marker.type === TOOL_MODES.GREEN;
         const p1 = teeDragged ? dragState.pixel : latlngToPixel(tee.lat, tee.lng, viewState.center, viewState.zoom, viewState.offset);
         const p2 = greenDragged ? dragState.pixel : latlngToPixel(green.lat, green.lng, viewState.center, viewState.zoom, viewState.offset);
         ctx.beginPath();
@@ -484,7 +912,7 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
     ctx.moveTo(0, canvasSize.h / 2);
     ctx.lineTo(canvasSize.w, canvasSize.h / 2);
     ctx.stroke();
-  }, [viewState, tileImages, markers, activeHole, canvasSize, polygons, latlngToPixel, dragState, overlay]);
+  }, [viewState, tileImages, markers, activeHole, activePolygon, canvasSize, polygons, latlngToPixel, dragState, overlay]);
 
   const wheelAccum = useRef(0);
   const handleWheel = useCallback((e) => {
@@ -641,6 +1069,8 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
       if (stateRef.current.moved) {
         const newLatLng = pixelToLatLng(x, y, viewState.center, viewState.zoom, viewState.offset);
         onPolyNodeDrag?.(stateRef.current.polyIndex, stateRef.current.pointIndex, newLatLng);
+      } else {
+        onPolyNodeClick?.(stateRef.current.polyIndex, stateRef.current.pointIndex);
       }
       setDragState(null);
     } else if (kind === "overlay") {
@@ -661,7 +1091,7 @@ function MapCanvas({ center, zoom, markers, activeHole, tool, onMapClick, onMark
     stateRef.current = { kind: null };
     // Restore cursor after space-pan
     if (spaceRef.current && canvasRef.current) canvasRef.current.style.cursor = "grab";
-  }, [viewState, canvasSize, tool, onMapClick, onMarkerClick, onMarkerDrag, onPolyNodeDrag, pixelToLatLng]);
+  }, [viewState, canvasSize, tool, onMapClick, onMarkerClick, onMarkerDrag, onPolyNodeDrag, onPolyNodeClick, pixelToLatLng]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -714,6 +1144,10 @@ export default function GolfCourseCreator() {
   const fileInputRef = useRef(null);
   const [terrainLoading, setTerrainLoading] = useState(false);
   const [terrainObjText, setTerrainObjText] = useState(null);
+  const [terrainBounds, setTerrainBounds] = useState(null);
+  const [terrainCourseJson, setTerrainCourseJson] = useState(null);
+  const [gameActive, setGameActive] = useState(false);
+  const [gameTrees,  setGameTrees]  = useState([]);
 
   const notify = (msg) => {
     setNotification(msg);
@@ -751,8 +1185,9 @@ export default function GolfCourseCreator() {
           return curr;
         });
       }, 50);
-    } else if ([TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH].includes(tool)) {
-      if (activePolygon !== null) {
+    } else if ([TOOL_MODES.GREEN_AREA, TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH].includes(tool)) {
+      const resuming = activePolygon !== null && polygons[activePolygon]?.type === tool;
+      if (resuming) {
         setPolygons(prev =>
           prev.map((p, i) =>
             i === activePolygon ? { ...p, points: [...p.points, latlng] } : p
@@ -798,6 +1233,22 @@ export default function GolfCourseCreator() {
       return curr;
     });
   }, []);
+
+  const handlePolyNodeClick = useCallback((polyIndex, pointIndex) => {
+    const poly = polygons[polyIndex];
+    const drawingTools = [TOOL_MODES.GREEN_AREA, TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH];
+    if (!drawingTools.includes(tool) || poly?.type !== tool) return;
+
+    if (polyIndex === activePolygon && pointIndex === 0 && poly.points.length >= 3) {
+      // Click first node of the active polygon — close and finish it
+      setActivePolygon(null);
+      notify("Shape closed");
+    } else {
+      // Click a node of a finished polygon — resume it
+      setActivePolygon(polyIndex);
+      notify(`Continuing ${TOOL_LABELS[tool]}`);
+    }
+  }, [polygons, tool, activePolygon]);
 
   const handlePolyNodeDrag = useCallback((polyIndex, pointIndex, newLatLng) => {
     setPolygons(prev =>
@@ -929,19 +1380,28 @@ export default function GolfCourseCreator() {
       };
     }
 
+    const holeData = holes.map(h => ({
+      ...h,
+      tee:      markers.find(m => m.hole === h.number && m.type === TOOL_MODES.TEE)   || null,
+      green:    markers.find(m => m.hole === h.number && m.type === TOOL_MODES.GREEN) || null,
+      features: polygons.filter(p => p.hole === h.number),
+    }));
+
     setTerrainLoading(true);
     try {
       const r = await fetch("/api/terrain", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bounds, resolution: 128, courseName }),
+        body: JSON.stringify({ bounds, resolution: 128, courseName, holeData }),
       });
       if (!r.ok) {
         const err = await r.json();
         throw new Error(err.error || "Terrain generation failed");
       }
-      const text = await r.text();
-      setTerrainObjText(text);
+      const data = await r.json();
+      setTerrainObjText(data.obj);
+      setTerrainBounds(bounds);
+      setTerrainCourseJson({ name: courseName, holes: holeData });
       notify("Terrain ready!");
     } catch (err) {
       notify(`Terrain error: ${err.message}`);
@@ -1205,8 +1665,15 @@ export default function GolfCourseCreator() {
               key={mode}
               onClick={() => {
                 setTool(mode);
-                if (activePolygon !== null && ![TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH].includes(mode)) {
-                  finishPolygon();
+                if (activePolygon !== null) {
+                  const drawingTools = [TOOL_MODES.GREEN_AREA, TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH];
+                  if (mode === TOOL_MODES.PAN) {
+                    // Temporary pan — keep activePolygon so we can resume
+                  } else if (drawingTools.includes(mode) && polygons[activePolygon]?.type === mode) {
+                    // Same drawing type — keep adding to this polygon
+                  } else {
+                    finishPolygon();
+                  }
                 }
               }}
               title={TOOL_LABELS[mode]}
@@ -1260,11 +1727,13 @@ export default function GolfCourseCreator() {
             markers={markers}
             polygons={polygons}
             activeHole={activeHole}
+            activePolygon={activePolygon}
             tool={tool}
             onMapClick={handleMapClick}
             onMarkerClick={handleMarkerClick}
             onMarkerDrag={handleMarkerDrag}
             onPolyNodeDrag={handlePolyNodeDrag}
+            onPolyNodeClick={handlePolyNodeClick}
             onRightClick={handleRightClick}
             overlay={overlay}
             onOverlayMove={handleOverlayMove}
@@ -1292,7 +1761,7 @@ export default function GolfCourseCreator() {
               Hole {activeHole}
               {tool === TOOL_MODES.TEE && " — Click to place tee"}
               {tool === TOOL_MODES.GREEN && " — Click to place green"}
-              {[TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH].includes(tool) && (activePolygon !== null ? " — Click to add points · Hold Space to pan · ✓ to finish" : " — Click to start drawing · Hold Space to pan")}
+              {[TOOL_MODES.GREEN_AREA, TOOL_MODES.FAIRWAY, TOOL_MODES.BUNKER, TOOL_MODES.WATER, TOOL_MODES.PATH].includes(tool) && (activePolygon !== null ? " — Click to add points · Hold Space to pan · ✓ to finish" : " — Click to start drawing · Hold Space to pan")}
               {tool === TOOL_MODES.PAN && " — Drag to pan · Scroll to zoom · Drag nodes to move"}
             </span>
           </div>
@@ -1846,11 +2315,25 @@ export default function GolfCourseCreator() {
       )}
 
       {/* Terrain 3D preview */}
-      {terrainObjText && (
+      {terrainObjText && !gameActive && (
         <TerrainPreview
           objText={terrainObjText}
+          bounds={terrainBounds}
+          courseJson={terrainCourseJson}
           courseName={courseName}
-          onClose={() => setTerrainObjText(null)}
+          onClose={() => { setTerrainObjText(null); setTerrainBounds(null); setTerrainCourseJson(null); }}
+          onPlay={(trees) => { setGameTrees(trees); setGameActive(true); }}
+        />
+      )}
+
+      {terrainObjText && gameActive && (
+        <GameView
+          objText={terrainObjText}
+          bounds={terrainBounds}
+          courseJson={terrainCourseJson}
+          courseName={courseName}
+          trees={gameTrees}
+          onClose={() => setGameActive(false)}
         />
       )}
 
