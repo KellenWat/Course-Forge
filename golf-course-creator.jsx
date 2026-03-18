@@ -734,6 +734,9 @@ function MapCanvas({ center, zoom, markers, activeHole, activePolygon, tool, onM
     const ctx = canvas.getContext("2d");
     ctx.setLineDash([]);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Wrap everything in try/catch: in React 18 an uncaught useEffect error
+    // (e.g. drawImage on an evicted image) unmounts the whole tree (white screen).
+    try {
 
     ctx.fillStyle = "#1a2332";
     ctx.fillRect(0, 0, canvasSize.w, canvasSize.h);
@@ -912,6 +915,11 @@ function MapCanvas({ center, zoom, markers, activeHole, activePolygon, tool, onM
     ctx.moveTo(0, canvasSize.h / 2);
     ctx.lineTo(canvasSize.w, canvasSize.h / 2);
     ctx.stroke();
+    } catch (err) {
+      // Swallow canvas draw errors (e.g. browser-evicted image bitmaps) so
+      // React 18 doesn't unmount the whole tree and white-screen the app.
+      console.warn("MapCanvas draw error (suppressed):", err?.message);
+    }
   }, [viewState, tileImages, markers, activeHole, activePolygon, canvasSize, polygons, latlngToPixel, dragState, overlay]);
 
   const wheelAccum = useRef(0);
@@ -1112,7 +1120,7 @@ function MapCanvas({ center, zoom, markers, activeHole, activePolygon, tool, onM
   );
 }
 
-export default function GolfCourseCreator() {
+export default function GolfCourseCreator({ onHome } = {}) {
   const [courseName, setCourseName] = useState("New Course");
   const [center, setCenter] = useState({ lat: 33.503, lng: -82.022 });
   const [zoom, setZoom] = useState(16);
@@ -1504,6 +1512,24 @@ export default function GolfCourseCreator() {
         flexShrink: 0,
         zIndex: 10,
       }}>
+        {onHome && (
+          <button
+            onClick={onHome}
+            style={{
+              background: "#21262d",
+              border: "1px solid #30363d",
+              borderRadius: 6,
+              color: "#c9d1d9",
+              padding: "5px 12px",
+              cursor: "pointer",
+              fontSize: 12,
+              fontFamily: "inherit",
+              marginRight: 4,
+            }}
+          >
+            ← Home
+          </button>
+        )}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontSize: 20 }}>⛳</span>
           <span style={{ fontFamily: "Outfit", fontWeight: 800, fontSize: 16, letterSpacing: "-0.02em", color: "#58a6ff" }}>

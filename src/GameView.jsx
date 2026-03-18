@@ -1,19 +1,30 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as THREE from "three";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { Line2 } from "three/examples/jsm/lines/Line2.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import RAPIER from "@dimforge/rapier3d-compat";
+import Minimap from "./Minimap.jsx";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const GRAVITY        = -9.81;
-const BALL_RADIUS    = 0.0214; // real golf ball radius in meters (scaled ×10 for visibility)
+const GRAVITY         = -9.81;
 const BALL_RADIUS_VIS = 0.3;
-const BALL_MASS      = 0.0459;
-const MAX_POWER      = 80;     // m/s max launch speed
-const HOLE_RADIUS    = 0.54;   // meters — if ball within this distance of pin, it's holed
+const BALL_MASS       = 0.0459;
+const HOLE_RADIUS     = 0.54;   // metres — if ball within this on landing, it's holed
+const EYE_HEIGHT      = 1.8;    // first-person camera height in metres
+
+// Magnus lift constant: F = K_MAGNUS * (ω × v), calibrated for a real golf ball
+// Derived from 2π·ρ·r³·Cm/m with r=0.02135m, ρ=1.225, Cm=0.5, m=0.0459
+const K_MAGNUS       = 4.2e-6;   // kg·s/m  (gives ~2 m/s² lift at 3000rpm, 70 m/s)
+const SPIN_DECAY     = 0.22;     // fraction of spin lost per second while airborne
+const AIR_LIN_DAMP   = 0.008;   // linear damping in flight (air resistance)
+const AIR_ANG_DAMP   = 0.06;    // angular damping in flight
+const FLIGHT_THRESH  = 0.5;     // m above terrain surface to be considered "in flight"
 
 // Low-poly feature colours (Three.js hex)
 const FEATURE_COLORS = {
@@ -22,16 +33,47 @@ const FEATURE_COLORS = {
   bunker:     0xe8d59a,
   water:      0x3a7bd5,
   path:       0xb0b8c0,
-  rough:      0x3a6b2a, // default terrain
+  rough:      0x3a6b2a,
 };
 
-// Try to load a GLTF asset; resolves to the scene or null if not found.
-// Drop files in /public/assets/ — e.g. /public/assets/tree.glb
+// Overlay render order — higher = renders on top
+const FEATURE_Z_ORDER = {
+  rough: 1, path: 2, fairway: 3, green_area: 4, water: 5, bunker: 6,
+};
+
+// Rolling surface physics [linearDamping, angularDamping]
+// Applied only when the ball is near/on the ground. Values calibrated to real
+// rolling friction coefficients:
+//   green  μ≈0.06, fairway μ≈0.18, rough μ≈0.55, bunker μ≈1.2
+const SURFACE_PHYSICS = {
+  green_area: [0.06, 0.18],
+  fairway:    [0.22, 0.55],
+  path:       [0.10, 0.25],
+  rough:      [0.80, 2.00],
+  bunker:     [1.50, 4.00],
+  water:      [3.50, 7.00],
+  default:    [0.50, 1.20],
+};
+
+// Tree model variants served from /Models/
+const TREE_MODEL_URLS = [
+  "/Models/tree_pineDefaultA.glb",
+  "/Models/tree_pineDefaultB.glb",
+  "/Models/tree_pineTallA.glb",
+  "/Models/tree_pineRoundC.glb",
+  "/Models/tree_pineRoundD.glb",
+  "/Models/tree_default.glb",
+  "/Models/tree_fat.glb",
+  "/Models/tree_oak.glb",
+  "/Models/tree_thin.glb",
+  "/Models/tree_small.glb",
+];
+
 const gltfLoader = new GLTFLoader();
 function loadGLTF(url) {
-  return new Promise(resolve => {
-    gltfLoader.load(url, gltf => resolve(gltf.scene), undefined, () => resolve(null));
-  });
+  return new Promise(resolve =>
+    gltfLoader.load(url, g => resolve(g.scene), undefined, () => resolve(null))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -55,85 +97,56 @@ function makeToXZ(bounds) {
   const mPerLat   = 110540;
   const mPerLon   = 111320 * Math.cos(centerLat * Math.PI / 180);
   return (lat, lng) => ({
-    x: -(lng - centerLon) * mPerLon, // X pre-negated to match OBJ export
+    x: -(lng - centerLon) * mPerLon,
     z:  (lat - centerLat) * mPerLat,
   });
 }
 
-// Degrees → radians
 const deg2rad = d => d * Math.PI / 180;
 
-// ---------------------------------------------------------------------------
-// fetchSatelliteTexture (same as TerrainPreview — tile stitching)
-// ---------------------------------------------------------------------------
-async function fetchSatelliteTexture(bounds) {
-  const { north, south, east, west } = bounds;
-  const zoom = 16;
-  const lon2tile = (lon, z) => Math.floor((lon + 180) / 360 * (1 << z));
-  const lat2tile = (lat, z) => Math.floor((1 - Math.log(Math.tan(lat * Math.PI / 180) + 1 / Math.cos(lat * Math.PI / 180)) / Math.PI) / 2 * (1 << z));
-
-  const tx0 = lon2tile(west, zoom),  tx1 = lon2tile(east, zoom);
-  const ty0 = lat2tile(north, zoom), ty1 = lat2tile(south, zoom);
-  const cols = tx1 - tx0 + 1, rows = ty1 - ty0 + 1;
-  const TW = 256;
-  const canvas = document.createElement("canvas");
-  canvas.width = cols * TW; canvas.height = rows * TW;
-  const ctx = canvas.getContext("2d");
-
-  await Promise.all(
-    Array.from({ length: rows }, (_, r) =>
-      Array.from({ length: cols }, (_, c) =>
-        new Promise(resolve => {
-          const img = new Image(); img.crossOrigin = "anonymous";
-          img.onload  = () => { ctx.drawImage(img, c * TW, r * TW, TW, TW); resolve(); };
-          img.onerror = () => resolve();
-          img.src = `/tiles/${zoom}/${ty0 + r}/${tx0 + c}`;
-        })
-      )
-    ).flat()
-  );
-  return canvas;
-}
+// Three.js raycaster used for terrain height queries (immune to Rapier winding issues).
+const _hRaycaster = new THREE.Raycaster();
+_hRaycaster.firstHitOnly = true;
+const _downDir = new THREE.Vector3(0, -1, 0);
 
 // ---------------------------------------------------------------------------
 // GameView component
 // ---------------------------------------------------------------------------
 export default function GameView({ objText, bounds, courseJson, courseName, trees = [], onClose }) {
-  const mountRef   = useRef(null);
-  const stateRef   = useRef(null); // mutable game state (Three.js + Rapier)
+  const mountRef = useRef(null);
+  const stateRef = useRef(null);
 
-  const [status,     setStatus]     = useState("loading"); // loading | ready | flying | holed
-  const [holeIndex,  setHoleIndex]  = useState(0);
-  const [shots,      setShots]      = useState([]);        // shots per hole [n, n, …]
-  const [shotCount,  setShotCount]  = useState(0);
-  const [power,      setPower]      = useState(60);        // 0-100 %
-  const [azimuth,    setAzimuth]    = useState(0);         // degrees, 0=north
-  const [loft,       setLoft]       = useState(12);        // degrees launch angle
-  const [wsStatus,   setWsStatus]   = useState("disconnected");
-  const [distToPin,  setDistToPin]  = useState(null);
+  const [status,      setStatus]      = useState("loading");
+  const [holeIndex,   setHoleIndex]   = useState(0);
+  const [shots,       setShots]       = useState([]);
+  const [shotCount,   setShotCount]   = useState(0);
+  const [ballSpeed,   setBallSpeed]   = useState(134);  // mph — ~60 m/s, typical 7-iron
+  const [launchAngle, setLaunchAngle] = useState(16);   // degrees
+  const [azimuth,     setAzimuth]     = useState(0);    // degrees, 0 = straight
+  const [backspinRpm, setBackspinRpm] = useState(5000); // rpm, positive = backspin
+  const [sidespinRpm, setSidespinRpm] = useState(0);    // rpm, + = draw, − = fade
+  const [wsStatus,    setWsStatus]    = useState("disconnected");
+  const [distToPin,   setDistToPin]   = useState(null);
+  const [shotOriginXZ, setShotOriginXZ] = useState(null); // null = use tee
 
   // -------------------------------------------------------------------------
-  // Build Three.js + Rapier scene once objText changes
+  // Build Three.js + Rapier scene
   // -------------------------------------------------------------------------
   useEffect(() => {
     if (!mountRef.current || !objText) return;
     let destroyed = false;
     let animId;
     let rapierWorld = null;
-    let ballBody    = null;
-    let ballMesh    = null;
-    let controls    = null;
     let renderer    = null;
-    let followBall  = false;
+    let controls    = null;
 
     (async () => {
-      // -- Rapier init --
       await RAPIER.init();
       if (destroyed) return;
 
       rapierWorld = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
 
-      // -- Three.js renderer --
+      // -- Renderer --
       const w = mountRef.current.clientWidth;
       const h = mountRef.current.clientHeight;
       renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -143,201 +156,356 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
       mountRef.current.appendChild(renderer.domElement);
 
       // -- Scene --
-      const scene  = new THREE.Scene();
-      scene.background = new THREE.Color(0x87ceeb); // sky blue
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87ceeb);
       scene.fog = new THREE.Fog(0x87ceeb, 800, 2000);
 
-      const ambient = new THREE.AmbientLight(0xffffff, 0.7);
-      scene.add(ambient);
-      const sun = new THREE.DirectionalLight(0xfffbe8, 1.2);
+      scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+      // Hemisphere light gives sky/ground colour to PBR (MeshStandardMaterial) tree models
+      const hemi = new THREE.HemisphereLight(0x87ceeb, 0x4a7a2a, 1.0);
+      scene.add(hemi);
+      const sun = new THREE.DirectionalLight(0xfffbe8, 1.5);
       sun.position.set(300, 600, 200);
       sun.castShadow = true;
       sun.shadow.mapSize.set(2048, 2048);
-      sun.shadow.camera.near = 1;
-      sun.shadow.camera.far  = 3000;
-      sun.shadow.camera.left = sun.shadow.camera.bottom = -800;
-      sun.shadow.camera.right = sun.shadow.camera.top  =  800;
+      sun.shadow.camera.near   = 1;
+      sun.shadow.camera.far    = 3000;
+      sun.shadow.camera.left   = sun.shadow.camera.bottom = -800;
+      sun.shadow.camera.right  = sun.shadow.camera.top   =  800;
       scene.add(sun);
 
-      // -- Camera --
-      const camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 5000);
+      // -- Camera + controls --
+      const camera = new THREE.PerspectiveCamera(70, w / h, 0.1, 5000);
       controls = new OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
 
       // -- Load terrain OBJ --
-      const terrainObj = new OBJLoader().parse(objText);
+      const terrainObj    = new OBJLoader().parse(objText);
       const terrainMeshes = [];
-      let minElev = Infinity, box = new THREE.Box3();
+      const box           = new THREE.Box3();
 
       terrainObj.traverse(child => {
         if (!(child instanceof THREE.Mesh)) return;
         child.receiveShadow = true;
-        child.castShadow    = false;
-        // Default rough colour — feature polygons will paint over this below
         child.material = new THREE.MeshLambertMaterial({ color: FEATURE_COLORS.rough, side: THREE.DoubleSide });
         terrainMeshes.push(child);
         box.expandByObject(child);
       });
       scene.add(terrainObj);
 
+      // Local height query using Three.js raycasting — works correctly with
+      // DoubleSide terrain regardless of triangle winding.
+      const groundY = (x, z, fallback) => {
+        _hRaycaster.set(new THREE.Vector3(x, 9999, z), _downDir);
+        const hits = _hRaycaster.intersectObjects(terrainMeshes, false);
+        return hits.length > 0 ? hits[0].point.y : fallback;
+      };
+
       const centre = new THREE.Vector3();
       box.getCenter(centre);
-      const size   = new THREE.Vector3();
+      const size = new THREE.Vector3();
       box.getSize(size);
-      const span   = Math.max(size.x, size.z);
+      const span = Math.max(size.x, size.z);
 
-      // Camera default: south of terrain, looking north (same as TerrainPreview)
-      camera.position.set(centre.x, centre.y + span * 0.5, centre.z - span * 0.9);
-      controls.target.copy(centre);
-      controls.update();
-
-      // -- Build Rapier trimesh collider from terrain geometry --
+      // -- Rapier trimesh collider from terrain geometry --
+      // Apply matrixWorld so local mesh coords are converted to world space before
+      // handing off to Rapier (mesh may be a child of a transformed Group).
       const verts = [], indices = [];
       let vOffset = 0;
+      const _v = new THREE.Vector3();
       for (const mesh of terrainMeshes) {
-        const geo  = mesh.geometry;
-        const pos  = geo.attributes.position;
-        const idx  = geo.index;
+        mesh.updateWorldMatrix(true, false);
+        const geo = mesh.geometry, pos = geo.attributes.position, idx = geo.index;
         for (let i = 0; i < pos.count; i++) {
-          verts.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+          _v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+          verts.push(_v.x, _v.y, _v.z);
         }
+        // Push both winding orders so the trimesh collides from both sides,
+        // regardless of OBJ winding (X-negation flips CCW→CW in this mesh).
         if (idx) {
-          for (let i = 0; i < idx.count; i++) indices.push(idx.getX(i) + vOffset);
+          for (let i = 0; i + 2 < idx.count; i += 3) {
+            const a = idx.getX(i) + vOffset, b = idx.getX(i+1) + vOffset, c = idx.getX(i+2) + vOffset;
+            indices.push(a, b, c);
+            indices.push(a, c, b);
+          }
         } else {
-          for (let i = 0; i < pos.count; i++) indices.push(i + vOffset);
+          for (let i = 0; i + 2 < pos.count; i += 3) {
+            indices.push(i + vOffset, i+1 + vOffset, i+2 + vOffset);
+            indices.push(i + vOffset, i+2 + vOffset, i+1 + vOffset);
+          }
         }
         vOffset += pos.count;
       }
-      const terrainDesc = RAPIER.ColliderDesc.trimesh(
-        new Float32Array(verts),
-        new Uint32Array(indices)
-      );
-      rapierWorld.createCollider(terrainDesc);
+      rapierWorld.createCollider(RAPIER.ColliderDesc.trimesh(new Float32Array(verts), new Uint32Array(indices)));
 
       // -- Ball mesh --
-      const ballGeo  = new THREE.SphereGeometry(BALL_RADIUS_VIS, 16, 16);
-      const ballMat  = new THREE.MeshPhongMaterial({ color: 0xffffff });
-      ballMesh       = new THREE.Mesh(ballGeo, ballMat);
-      ballMesh.castShadow = true;
-      ballMesh.visible    = false;
+      const ballMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(BALL_RADIUS_VIS, 16, 16),
+        new THREE.MeshPhongMaterial({ color: 0xffffff })
+      );
+      ballMesh.castShadow  = true;
+      ballMesh.visible     = false;
+      ballMesh.renderOrder = 2;
       scene.add(ballMesh);
 
-      // -- Ball trail --
-      const trailPoints = [];
-      const trailGeo    = new THREE.BufferGeometry();
-      const trailMat    = new THREE.LineBasicMaterial({ color: 0xffff00, opacity: 0.5, transparent: true });
-      const trailLine   = new THREE.Line(trailGeo, trailMat);
+      // -- Shot tracer (Line2 = fat line, visible at any linewidth) --
+      const trailPoints = [];   // THREE.Vector3[]
+      const trailGeo    = new LineGeometry();
+      const trailMat    = new LineMaterial({
+        color: 0xffffff,
+        linewidth: 3,          // screen-space pixels
+        transparent: true,
+        opacity: 0.90,
+        resolution: new THREE.Vector2(w, h),
+        depthTest: true,
+        depthWrite: false,
+      });
+      // Seed geometry with two identical dummy points so Line2 is valid before first shot
+      trailGeo.setPositions([0, 0, 0, 0, 0, 0]);
+      const trailLine = new Line2(trailGeo, trailMat);
+      trailLine.visible = false;
+      trailLine.renderOrder = 3;
       scene.add(trailLine);
 
-      // -- Hole markers (flag + cup) --
-      const toXZ        = makeToXZ(bounds);
-      const holeObjects = []; // { pinXZ, flagGroup, holeIndex }
+      // -- Load GLTF assets --
+      const toXZ = makeToXZ(bounds);
+      const [flagModel, ...treeModelsList] =
+        await Promise.all([loadGLTF("/Models/flag-green.glb"), ...TREE_MODEL_URLS.map(loadGLTF)]);
+      if (destroyed) return;
+      const treeModels = treeModelsList.filter(Boolean);
 
-      for (const hole of (courseJson?.holes || [])) {
-        const pin = hole.markers?.find(m => m.type === "green") ||
-                    courseJson?.markers?.find(m => m.hole === hole.number && m.type === "green");
-        if (!pin) continue;
-        const { x, z } = toXZ(pin.lat, pin.lng);
+      // -- Hole markers: tee boxes, flags, cup rings --
+      const holeObjects  = []; // { pinXZ, camPos, camTarget, holeNumber }
+      const markers      = courseJson?.markers || [];
+      const holes        = courseJson?.holes   || [];
 
-        // Raycast down to find Y
-        const ray = new RAPIER.Ray({ x, y: 500, z }, { x: 0, y: -1, z: 0 });
-        const hit = rapierWorld.castRay(ray, 1000, true);
-        const y   = hit ? 500 - hit.timeOfImpact : centre.y;
+      for (const hole of holes) {
+        const teeM = markers.find(m => m.hole === hole.number && m.type === "tee") || hole.tee;
+        const pinM = markers.find(m => m.hole === hole.number && m.type === "green") || hole.green;
 
-        // Flag pole
-        const poleGeo  = new THREE.CylinderGeometry(0.03, 0.03, 3, 6);
-        const poleMat  = new THREE.MeshLambertMaterial({ color: 0xffffff });
-        const pole     = new THREE.Mesh(poleGeo, poleMat);
-        pole.position.set(x, y + 1.5, z);
-        pole.castShadow = true;
+        // --- Tee box ---
+        if (teeM) {
+          const { x, z } = toXZ(teeM.lat, teeM.lng);
+          const ty = groundY(x, z, centre.y);
+          const teeBox = new THREE.Mesh(
+            new THREE.BoxGeometry(3, 0.08, 2),
+            new THREE.MeshLambertMaterial({ color: 0xb8e090 })
+          );
+          teeBox.position.set(x, ty + 0.04, z);
+          teeBox.receiveShadow = true;
+          scene.add(teeBox);
+        }
 
-        // Flag
-        const flagGeo  = new THREE.PlaneGeometry(0.8, 0.5);
-        const flagMat  = new THREE.MeshLambertMaterial({ color: 0xff2222, side: THREE.DoubleSide });
-        const flag     = new THREE.Mesh(flagGeo, flagMat);
-        flag.position.set(x + 0.4, y + 2.8, z);
+        // --- Flag + cup ring ---
+        let pinXZ = null;
+        if (pinM) {
+          const { x, z } = toXZ(pinM.lat, pinM.lng);
+          const py = groundY(x, z, centre.y);
+          pinXZ = { x, y: py, z };
 
-        // Cup ring
-        const ringGeo  = new THREE.RingGeometry(HOLE_RADIUS * 0.8, HOLE_RADIUS, 16);
-        const ringMat  = new THREE.MeshLambertMaterial({ color: 0x222222, side: THREE.DoubleSide });
-        const ring     = new THREE.Mesh(ringGeo, ringMat);
-        ring.rotation.x = -Math.PI / 2;
-        ring.position.set(x, y + 0.02, z);
+          // Cup ring (always shown regardless of flag model)
+          const ring = new THREE.Mesh(
+            new THREE.RingGeometry(HOLE_RADIUS * 0.8, HOLE_RADIUS, 16),
+            new THREE.MeshLambertMaterial({ color: 0x222222, side: THREE.DoubleSide })
+          );
+          ring.rotation.x = -Math.PI / 2;
+          ring.position.set(x, py + 0.02, z);
+          scene.add(ring);
 
-        scene.add(pole, flag, ring);
-        holeObjects.push({ pinXZ: { x, y, z }, holeNumber: hole.number });
+          if (flagModel) {
+            const flag = flagModel.clone();
+            flag.scale.setScalar(3);
+            flag.position.set(x, py, z);
+            flag.traverse(c => { if (c.isMesh) c.castShadow = true; });
+            scene.add(flag);
+          } else {
+            // Fallback: simple pole + plane flag
+            const pole = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.03, 0.03, 3, 6),
+              new THREE.MeshLambertMaterial({ color: 0xffffff })
+            );
+            pole.position.set(x, py + 1.5, z);
+            pole.castShadow = true;
+            const flagPlane = new THREE.Mesh(
+              new THREE.PlaneGeometry(0.8, 0.5),
+              new THREE.MeshLambertMaterial({ color: 0xff2222, side: THREE.DoubleSide })
+            );
+            flagPlane.position.set(x + 0.4, py + 2.8, z);
+            scene.add(pole, flagPlane);
+          }
+        }
+
+        // --- Per-hole first-person camera position ---
+        let camPos, camTarget, nearTarget;
+        if (teeM) {
+          const { x: tx, z: tz } = toXZ(teeM.lat, teeM.lng);
+          const ty = groundY(tx, tz, centre.y);
+          camPos = new THREE.Vector3(tx, ty + EYE_HEIGHT, tz);
+          if (pinM && pinXZ) {
+            camTarget = new THREE.Vector3(pinXZ.x, pinXZ.y + 1.0, pinXZ.z);
+            const dx = pinXZ.x - tx, dz = pinXZ.z - tz;
+            const d  = Math.sqrt(dx * dx + dz * dz) || 1;
+            nearTarget = new THREE.Vector3(tx + (dx / d) * 10, ty + EYE_HEIGHT, tz + (dz / d) * 10);
+          } else {
+            camTarget  = new THREE.Vector3(tx, ty + EYE_HEIGHT, tz + 50);
+            nearTarget = new THREE.Vector3(tx, ty + EYE_HEIGHT, tz + 10);
+          }
+        } else {
+          camPos     = new THREE.Vector3(centre.x, centre.y + span * 0.5, centre.z - span * 0.9);
+          camTarget  = centre.clone();
+          nearTarget = centre.clone();
+        }
+
+        holeObjects.push({ pinXZ, camPos, camTarget, nearTarget, holeNumber: hole.number });
       }
 
-      // -- Low-poly feature polygon overlays --
-      // For each drawn feature polygon, place a flat mesh just above the terrain
-      // coloured by feature type (fairway=green, bunker=sand, water=blue, etc.)
-      for (const hole of (courseJson?.holes || [])) {
+      // -- Feature polygon overlays --
+      // Point-in-polygon test (XZ plane, ray-casting algorithm)
+      const pip = (px, pz, poly) => {
+        let inside = false;
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const xi = poly[i].x, zi = poly[i].z;
+          const xj = poly[j].x, zj = poly[j].z;
+          if (((zi > pz) !== (zj > pz)) && (px < (xj - xi) * (pz - zi) / (zj - zi) + xi))
+            inside = !inside;
+        }
+        return inside;
+      };
+
+      for (const hole of holes) {
         for (const feat of (hole.features || [])) {
           if (!feat.points || feat.points.length < 3) continue;
           const color = FEATURE_COLORS[feat.type] || FEATURE_COLORS.rough;
           const pts2d = feat.points.map(p => toXZ(p.lat, p.lng));
 
-          // Build a flat polygon mesh slightly above ground (Y=0.15 m)
-          const shape = new THREE.Shape(pts2d.map(p => new THREE.Vector2(p.x, p.z)));
-          const geo   = new THREE.ShapeGeometry(shape);
-          // ShapeGeometry uses XY — rotate to XZ plane
-          geo.rotateX(-Math.PI / 2);
-          const mat  = new THREE.MeshLambertMaterial({
+          // Build a grid mesh that drapes onto terrain (3m cell resolution)
+          const minX = Math.min(...pts2d.map(p => p.x));
+          const maxX = Math.max(...pts2d.map(p => p.x));
+          const minZ = Math.min(...pts2d.map(p => p.z));
+          const maxZ = Math.max(...pts2d.map(p => p.z));
+          const step = 3;
+          const xs = [], zs = [];
+          for (let x = minX - step; x <= maxX + step; x += step) xs.push(x);
+          for (let z = minZ - step; z <= maxZ + step; z += step) zs.push(z);
+
+          const positions = [];
+          const gridIdx   = new Map();
+          for (let zi = 0; zi < zs.length; zi++) {
+            for (let xi = 0; xi < xs.length; xi++) {
+              const x = xs[xi], z = zs[zi];
+              if (!pip(x, z, pts2d)) continue;
+              // Use centre.y as fallback so edge points still get placed
+              const gy = groundY(x, z, centre.y);
+              gridIdx.set(`${xi},${zi}`, positions.length / 3);
+              positions.push(x, gy + 0.05, z);
+            }
+          }
+          if (positions.length === 0) continue;
+
+          const triIdx = [];
+          for (let zi = 0; zi < zs.length - 1; zi++) {
+            for (let xi = 0; xi < xs.length - 1; xi++) {
+              const tl = gridIdx.get(`${xi},${zi}`);
+              const tr = gridIdx.get(`${xi+1},${zi}`);
+              const bl = gridIdx.get(`${xi},${zi+1}`);
+              const br = gridIdx.get(`${xi+1},${zi+1}`);
+              if (tl !== undefined && tr !== undefined && bl !== undefined)
+                triIdx.push(tl, tr, bl);
+              if (tr !== undefined && br !== undefined && bl !== undefined)
+                triIdx.push(tr, br, bl);
+            }
+          }
+          if (triIdx.length === 0) continue;
+
+          const geo = new THREE.BufferGeometry();
+          geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+          geo.setIndex(triIdx);
+          geo.computeVertexNormals();
+
+          const mat = new THREE.MeshLambertMaterial({
             color,
             side: THREE.DoubleSide,
-            transparent: feat.type === "water",
-            opacity:     feat.type === "water" ? 0.85 : 1.0,
+            transparent: true,
+            opacity: feat.type === "water" ? 0.85 : 0.93,
+            polygonOffset: true,
+            polygonOffsetFactor: -4,
+            polygonOffsetUnits: -4,
+            depthWrite: false,
           });
           const mesh = new THREE.Mesh(geo, mat);
-          mesh.position.y = 0.15;
-          mesh.receiveShadow = true;
+          mesh.renderOrder = FEATURE_Z_ORDER[feat.type] ?? 1;
           scene.add(mesh);
         }
       }
 
-      // -- Trees from satellite detection --
-      // Tries to load /public/assets/tree.glb first; falls back to cone+cylinder primitive
-      const treeProto = await loadGLTF("/assets/tree.glb");
-      if (destroyed) return;
-
+      // -- Trees --
       const trunkMat  = new THREE.MeshLambertMaterial({ color: 0x6b4226 });
       const canopyMat = new THREE.MeshLambertMaterial({ color: 0x2d5e1e });
 
+      const terrainMinY = box.min.y;
+      const terrainMaxY = box.max.y;
+
+      const _treeBox = new THREE.Box3();
       for (const tree of trees) {
         const { x, z } = toXZ(tree.lat, tree.lng);
-        const tRay = new RAPIER.Ray({ x, y: 500, z }, { x: 0, y: -1, z: 0 });
-        const tHit = rapierWorld.castRay(tRay, 1000, true);
-        const groundY = tHit ? 500 - tHit.timeOfImpact : centre.y;
-        const treeH = Math.max((tree.heightAboveGround || 1) * 6, 12);
+        const gy = groundY(x, z, centre.y);
+        // Skip trees that land way outside plausible terrain range
+        if (gy < terrainMinY - 10 || gy > terrainMaxY + 30) continue;
+        const treeH = Math.max((tree.heightAboveGround || 1) * 6, 15);
 
         let treeObj;
-        if (treeProto) {
-          treeObj = treeProto.clone();
-          treeObj.scale.setScalar(treeH / 10);
+        if (treeModels.length > 0) {
+          treeObj = treeModels[Math.floor(Math.random() * treeModels.length)].clone();
+          treeObj.scale.setScalar(treeH / 5);
           treeObj.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+          // Snap the GLTF model's base to terrain surface regardless of model origin
+          treeObj.position.set(x, gy, z);
+          _treeBox.setFromObject(treeObj);
+          if (!_treeBox.isEmpty()) treeObj.position.y += gy - _treeBox.min.y;
         } else {
-          // Primitive fallback
           treeObj = new THREE.Group();
-          const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, treeH * 0.35, 6), trunkMat);
+          const trunk  = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, treeH * 0.35, 6), trunkMat);
           trunk.position.y = treeH * 0.175;
           trunk.castShadow = true;
           const canopy = new THREE.Mesh(new THREE.ConeGeometry(treeH * 0.28, treeH * 0.7, 7), canopyMat);
-          canopy.position.y = treeH * 0.35 + treeH * 0.35;
+          canopy.position.y = treeH * 0.7;
           canopy.castShadow = true;
           treeObj.add(trunk, canopy);
+          treeObj.position.set(x, gy, z);
         }
-        treeObj.position.set(x, groundY, z);
         scene.add(treeObj);
       }
 
+      // -- Set camera for hole 0 (first-person at tee) --
+      if (holeObjects[0]) {
+        camera.position.copy(holeObjects[0].camPos);
+        camera.lookAt(holeObjects[0].camTarget);
+        controls.target.copy(holeObjects[0].nearTarget);
+      } else {
+        camera.position.set(centre.x, centre.y + span * 0.5, centre.z - span * 0.9);
+        controls.target.copy(centre);
+      }
+      controls.enableZoom = false;
+      controls.update();
+
       // -- Store mutable state --
+      // Flat list of world-XZ polygons used for surface physics detection
+      const surfacePolygons = holes.flatMap(hole =>
+        (hole.features || [])
+          .filter(f => f.points?.length >= 3)
+          .map(f => ({ type: f.type, pts: f.points.map(p => toXZ(p.lat, p.lng)) }))
+      );
+
       stateRef.current = {
         scene, camera, renderer, controls, rapierWorld,
-        terrainMeshes, holeObjects, toXZ,
+        terrainMeshes, groundY, holeObjects, toXZ,
         ballMesh, ballBody: null,
-        trailPoints, trailGeo, trailLine,
+        trailPoints, trailGeo, trailMat, trailLine,
         followBall: false,
+        surfacePolygons,
         centre, span,
+        ballSpin: null,     // { backspin: rpm, sidespin: rpm } — set on each shot
+        lastBallPos: null,  // { x, y, z } — where ball last stopped
       };
 
       // -- Animate --
@@ -355,41 +523,132 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
         if (!ref) return;
 
         if (ref.ballBody) {
-          // Step physics
-          const steps = Math.round(dt / FIXED_DT);
-          for (let i = 0; i < steps; i++) {
-            ref.rapierWorld.step();
+          const vel   = ref.ballBody.linvel();
+          const vLen  = Math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2);
+          const t_pre = ref.ballBody.translation();
+
+          // --- Surface type detection (XZ polygon test) ---
+          let surfType = "default", bestOrder = -1;
+          if (ref.surfacePolygons?.length) {
+            for (const { type, pts } of ref.surfacePolygons) {
+              let inside = false;
+              for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+                const xi = pts[i].x, zi = pts[i].z, xj = pts[j].x, zj = pts[j].z;
+                if (((zi > t_pre.z) !== (zj > t_pre.z)) &&
+                    (t_pre.x < (xj - xi) * (t_pre.z - zi) / (zj - zi) + xi))
+                  inside = !inside;
+              }
+              if (inside) {
+                const order = FEATURE_Z_ORDER[type] ?? 0;
+                if (order > bestOrder) { bestOrder = order; surfType = type; }
+              }
+            }
           }
 
-          // Sync ball mesh
+          // --- Flight detection: is ball sufficiently above terrain? ---
+          const terrY = ref.groundY
+            ? ref.groundY(t_pre.x, t_pre.z, t_pre.y - BALL_RADIUS_VIS)
+            : (t_pre.y - BALL_RADIUS_VIS);
+          const inFlight = (t_pre.y - terrY - BALL_RADIUS_VIS) > FLIGHT_THRESH;
+
+          if (inFlight) {
+            ref.ballBody.setLinearDamping(AIR_LIN_DAMP);
+            ref.ballBody.setAngularDamping(AIR_ANG_DAMP);
+          } else {
+            const [ld, ad] = SURFACE_PHYSICS[surfType] ?? SURFACE_PHYSICS.default;
+            ref.ballBody.setLinearDamping(ld);
+            ref.ballBody.setAngularDamping(ad);
+          }
+
+          // --- Magnus force (backspin lift + sidespin draw/fade) ---
+          const spin = ref.ballSpin;
+          if (spin && inFlight && vLen > 1) {
+            const hLen = Math.sqrt(vel.x ** 2 + vel.z ** 2);
+            let Fx = 0, Fy = 0, Fz = 0;
+            if (hLen > 0.1) {
+              const vxn = vel.x / hLen, vzn = vel.z / hLen;
+              // Backspin angular velocity axis = -normalize(worldUp × vDir)
+              // For flight along vDir, backspin ω = backspin_rad * (-vzn, 0, vxn)
+              const ω_back = spin.backspin * (2 * Math.PI / 60);
+              const ωbx = -vzn * ω_back, ωbz = vxn * ω_back;
+              // Sidespin: ω around Y axis (+ = draw/left, - = fade/right)
+              const ωy = spin.sidespin * (2 * Math.PI / 60);
+              // Magnus: F = K_MAGNUS * (ω × v), applied as force in Newtons (×mass inside K)
+              Fx = K_MAGNUS * (ωy * vel.z - ωbz * vel.y);
+              Fy = K_MAGNUS * (ωbz * vel.x - ωbx * vel.z);
+              Fz = K_MAGNUS * (ωbx * vel.y - ωy * vel.x);
+            }
+            // Spin decay
+            spin.backspin *= (1 - SPIN_DECAY * dt);
+            spin.sidespin *= (1 - SPIN_DECAY * dt);
+            // Apply force each sub-step
+            const steps = Math.round(dt / FIXED_DT);
+            for (let i = 0; i < steps; i++) {
+              ref.ballBody.addForce({ x: Fx, y: Fy, z: Fz }, true);
+              ref.rapierWorld.step();
+            }
+          } else {
+            const steps = Math.round(dt / FIXED_DT);
+            for (let i = 0; i < steps; i++) ref.rapierWorld.step();
+          }
+
           const t = ref.ballBody.translation();
           ref.ballMesh.position.set(t.x, t.y, t.z);
 
-          // Trail
           ref.trailPoints.push(new THREE.Vector3(t.x, t.y, t.z));
           if (ref.trailPoints.length > 300) ref.trailPoints.shift();
-          ref.trailGeo.setFromPoints(ref.trailPoints);
+          if (ref.trailPoints.length >= 2) {
+            const flat = new Float32Array(ref.trailPoints.length * 3);
+            for (let i = 0; i < ref.trailPoints.length; i++) {
+              flat[i * 3]     = ref.trailPoints[i].x;
+              flat[i * 3 + 1] = ref.trailPoints[i].y;
+              flat[i * 3 + 2] = ref.trailPoints[i].z;
+            }
+            ref.trailGeo.setPositions(flat);
+            ref.trailLine.visible = true;
+          }
 
-          // Follow camera
           if (ref.followBall) {
-            const vel = ref.ballBody.linvel();
-            const speed = Math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2);
-            const behindX = t.x - vel.x * 3;
-            const behindZ = t.z - vel.z * 3;
+            const speed = vLen;
+
+            // Chase cam: orbit around ball from above/behind
             ref.camera.position.lerp(
-              new THREE.Vector3(behindX, t.y + 8, behindZ), 0.05
+              new THREE.Vector3(t.x - vel.x * 3, t.y + 8, t.z - vel.z * 3), 0.05
             );
             ref.controls.target.lerp(new THREE.Vector3(t.x, t.y, t.z), 0.1);
 
-            // Check if ball has nearly stopped
             if (speed < 0.3) {
-              ref.followBall = false;
-              ref.ballBody   = null;
+              ref.followBall  = false;
+              ref.ballBody    = null;
+              ref.lastBallPos = { x: t.x, y: t.y, z: t.z };
               setStatus("ready");
+              setShotOriginXZ({ x: t.x, z: t.z });
 
-              // Check hole-in distance
-              const curHole = ref.holeObjects[stateRef.current._holeIndex ?? 0];
-              if (curHole) {
+              // Position camera at ball's resting spot, looking toward pin
+              const hi  = stateRef.current._holeIndex ?? 0;
+              const pin = ref.holeObjects[hi]?.pinXZ;
+              const camY = terrY + EYE_HEIGHT;
+              if (pin) {
+                const dx = pin.x - t.x, dz = pin.z - t.z;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                const lookX = dist > 2 ? pin.x : t.x + dx * 5;
+                const lookZ = dist > 2 ? pin.z : t.z + dz * 5;
+                ref.camera.position.set(t.x, camY, t.z);
+                ref.camera.lookAt(lookX, camY - 1, lookZ);
+                ref.controls.target.set(lookX, camY - 1, lookZ);
+              } else {
+                const cam = ref.holeObjects[hi];
+                if (cam) {
+                  ref.camera.position.copy(cam.camPos);
+                  ref.camera.lookAt(cam.camTarget);
+                  ref.controls.target.copy(cam.nearTarget);
+                }
+              }
+              ref.controls.update();
+
+              // Check hole distance
+              const curHole = ref.holeObjects[hi];
+              if (curHole?.pinXZ) {
                 const dx = t.x - curHole.pinXZ.x;
                 const dz = t.z - curHole.pinXZ.z;
                 const d  = Math.sqrt(dx * dx + dz * dz);
@@ -413,19 +672,17 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
         stateRef.current.renderer.setSize(w, h);
         stateRef.current.camera.aspect = w / h;
         stateRef.current.camera.updateProjectionMatrix();
+        stateRef.current.trailMat.resolution.set(w, h);
       };
       window.addEventListener("resize", onResize);
 
       setStatus("ready");
-      stateRef.current._cleanup = () => {
-        window.removeEventListener("resize", onResize);
-      };
+      stateRef.current._cleanup = () => window.removeEventListener("resize", onResize);
     })();
 
     return () => {
       destroyed = true;
       cancelAnimationFrame(animId);
-      // Null stateRef first so the animate loop bails if it gets one more tick
       const savedState = stateRef.current;
       stateRef.current = null;
       try { savedState?._cleanup?.(); } catch {}
@@ -442,72 +699,78 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     const ref = stateRef.current;
     if (!ref || !ref.rapierWorld) return;
 
-    // Remove old ball body
     if (ref.ballBody) {
       ref.rapierWorld.removeRigidBody(ref.ballBody);
       ref.ballBody = null;
     }
 
-    // Find tee position for current hole
-    const currentHole = (courseJson?.holes || [])[holeIndex];
-    const tee = courseJson?.markers?.find(m =>
-      m.hole === currentHole?.number && m.type === "tee"
-    );
-
+    // Shot origin: use last ball position if available, otherwise tee
     let startX, startZ;
-    if (tee) {
-      const { x, z } = ref.toXZ(tee.lat, tee.lng);
-      startX = x; startZ = z;
+    if (ref.lastBallPos) {
+      startX = ref.lastBallPos.x;
+      startZ = ref.lastBallPos.z;
     } else {
-      startX = ref.centre.x; startZ = ref.centre.z;
+      const currentHole = (courseJson?.holes || [])[holeIndex];
+      const teeM = (courseJson?.markers || []).find(m =>
+        m.hole === currentHole?.number && m.type === "tee"
+      ) || currentHole?.tee;
+      if (teeM) {
+        const { x, z } = ref.toXZ(teeM.lat, teeM.lng);
+        startX = x; startZ = z;
+      } else {
+        startX = ref.centre.x; startZ = ref.centre.z;
+      }
     }
 
-    // Raycast to find ground Y at tee
-    const ray = new RAPIER.Ray({ x: startX, y: 500, z: startZ }, { x: 0, y: -1, z: 0 });
-    const hit = ref.rapierWorld.castRay(ray, 1000, true);
-    const groundY = hit ? 500 - hit.timeOfImpact : ref.centre.y;
-    const startY  = groundY + BALL_RADIUS_VIS + 0.1;
+    const gy     = ref.groundY ? ref.groundY(startX, startZ, ref.centre.y) : ref.centre.y;
+    const startY = gy + BALL_RADIUS_VIS + 0.05;
 
-    // Create rigid body
     const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(startX, startY, startZ)
-      .setLinearDamping(0.1)
-      .setAngularDamping(0.5);
+      .setLinearDamping(AIR_LIN_DAMP)
+      .setAngularDamping(AIR_ANG_DAMP)
+      .setCcdEnabled(true);
     const body = ref.rapierWorld.createRigidBody(bodyDesc);
+    ref.rapierWorld.createCollider(
+      RAPIER.ColliderDesc.ball(BALL_RADIUS_VIS)
+        .setRestitution(0.55)
+        .setFriction(0.35)
+        .setMass(BALL_MASS),
+      body
+    );
 
-    const colDesc = RAPIER.ColliderDesc.ball(BALL_RADIUS_VIS)
-      .setRestitution(0.6)
-      .setFriction(0.4)
-      .setMass(BALL_MASS);
-    ref.rapierWorld.createCollider(colDesc, body);
-
-    // Compute launch velocity
-    const speed   = (power / 100) * MAX_POWER;
-    const loftRad = deg2rad(loft);
-    const azRad   = deg2rad(azimuth); // 0 = north (+Z), 90 = east (-X in our negated system)
-    const vx      = -Math.sin(azRad) * Math.cos(loftRad) * speed;
-    const vy      =  Math.sin(loftRad) * speed;
-    const vz      =  Math.cos(azRad)   * Math.cos(loftRad) * speed;
+    // Ball speed: mph → m/s
+    const speedMs  = ballSpeed * 0.44704;
+    const loftRad  = deg2rad(launchAngle);
+    const azRad    = deg2rad(azimuth);
+    const vx = -Math.sin(azRad) * Math.cos(loftRad) * speedMs;
+    const vy =  Math.sin(loftRad) * speedMs;
+    const vz =  Math.cos(azRad)   * Math.cos(loftRad) * speedMs;
     body.setLinvel({ x: vx, y: vy, z: vz }, true);
 
-    ref.ballBody    = body;
-    ref.ballMesh.visible  = true;
+    // Store spin for Magnus effect application during flight
+    ref.ballSpin = { backspin: backspinRpm, sidespin: sidespinRpm };
+
+    ref.ballBody              = body;
+    ref.lastBallPos           = null;  // clear until this shot stops
+    ref.ballMesh.visible      = true;
     ref.ballMesh.position.set(startX, startY, startZ);
-    ref.trailPoints.length = 0;
-    ref.followBall  = true;
+    ref.trailPoints.length    = 0;
+    ref.trailLine.visible     = false;
+    ref.trailGeo.setPositions([startX, startY, startZ, startX, startY, startZ]);
+    ref.followBall            = true;
+    stateRef.current._holeIndex = holeIndex;
+
     ref.camera.position.set(startX - vx * 0.2, startY + 6, startZ - vz * 0.2);
     ref.controls.target.set(startX, startY, startZ);
-
-    // Track hole index for landing check
-    stateRef.current._holeIndex = holeIndex;
 
     setShotCount(c => c + 1);
     setDistToPin(null);
     setStatus("flying");
-  }, [courseJson, holeIndex, power, azimuth, loft]);
+  }, [courseJson, holeIndex, ballSpeed, launchAngle, azimuth, backspinRpm, sidespinRpm]);
 
   // -------------------------------------------------------------------------
-  // WebSocket launch monitor connection
+  // WebSocket launch monitor
   // -------------------------------------------------------------------------
   useEffect(() => {
     let ws;
@@ -520,11 +783,19 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
         ws.onmessage = (e) => {
           try {
             const data = JSON.parse(e.data);
-            // GSPro-style: { BallSpeed, LaunchAngle, LaunchDirection }
-            if (data.BallSpeed    != null) setPower(Math.min(100, (data.BallSpeed / MAX_POWER) * 100));
-            if (data.LaunchAngle  != null) setLoft(data.LaunchAngle);
-            if (data.LaunchDirection != null) setAzimuth(data.LaunchDirection);
-            // Auto-launch on shot received
+            // BallSpeed in m/s → convert to mph
+            if (data.BallSpeed       != null) setBallSpeed(Math.round(data.BallSpeed * 2.23694));
+            if (data.LaunchAngle     != null) setLaunchAngle(Math.round(data.LaunchAngle));
+            if (data.LaunchDirection != null) setAzimuth(Math.round(data.LaunchDirection));
+            // Spin fields (GSPro extended format)
+            if (data.BackSpin  != null) setBackspinRpm(Math.round(data.BackSpin));
+            if (data.SideSpin  != null) setSidespinRpm(Math.round(data.SideSpin));
+            // SpinAxis/TotalSpin → decompose into back/side
+            if (data.TotalSpin != null && data.SpinAxis != null) {
+              const axRad = data.SpinAxis * Math.PI / 180;
+              setBackspinRpm(Math.round(data.TotalSpin * Math.cos(axRad)));
+              setSidespinRpm(Math.round(data.TotalSpin * Math.sin(axRad)));
+            }
             setTimeout(() => launchBall(), 100);
           } catch {}
         };
@@ -535,24 +806,66 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
   }, [launchBall]);
 
   // -------------------------------------------------------------------------
+  // Sync azimuth to tee→pin bearing when hole changes
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (!bounds || !courseJson) return;
+    const toXZ = makeToXZ(bounds);
+    const hole = (courseJson?.holes || [])[holeIndex];
+    const teeM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "tee") || hole?.tee;
+    const pinM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "green") || hole?.green;
+    if (!teeM || !pinM) return;
+    const tee = toXZ(teeM.lat, teeM.lng);
+    const pin = toXZ(pinM.lat, pinM.lng);
+    const dx = pin.x - tee.x;
+    const dz = pin.z - tee.z;
+    // flipX=true convention: positive az = right, az = atan2(-dx, dz)
+    const az = Math.atan2(-dx, dz) * 180 / Math.PI;
+    const clamped = Math.round(Math.max(-90, Math.min(90, az)));
+    setAzimuth(clamped);
+    // Also pivot the camera immediately if the scene is ready
+    const ref = stateRef.current;
+    if (ref && !ref.followBall) {
+      const azRad = clamped * Math.PI / 180;
+      const hi = holeIndex;
+      const teePos = ref.holeObjects?.[hi]?.camPos;
+      if (teePos) {
+        const tx = teePos.x + (-Math.sin(azRad)) * 120;
+        const ty = teePos.y - 1.2;
+        const tz = teePos.z + Math.cos(azRad) * 120;
+        ref.camera.position.copy(teePos);
+        ref.camera.lookAt(tx, ty, tz);
+        ref.controls.target.set(tx, ty, tz);
+        ref.controls.update();
+      }
+    }
+  }, [bounds, courseJson, holeIndex]);
+
+  // -------------------------------------------------------------------------
   // Advance to next hole
   // -------------------------------------------------------------------------
   const nextHole = useCallback(() => {
-    setShots(s => {
-      const next = [...s];
-      next[holeIndex] = shotCount;
-      return next;
-    });
-    setHoleIndex(i => i + 1);
+    setShots(s => { const next = [...s]; next[holeIndex] = shotCount; return next; });
+    const nextIdx = holeIndex + 1;
+    setHoleIndex(nextIdx);
     setShotCount(0);
     setStatus("ready");
     setDistToPin(null);
+    setShotOriginXZ(null);
 
-    // Reset camera
     const ref = stateRef.current;
     if (ref) {
-      ref.camera.position.set(ref.centre.x, ref.centre.y + ref.span * 0.5, ref.centre.z - ref.span * 0.9);
-      ref.controls.target.copy(ref.centre);
+      ref.lastBallPos = null;  // reset to tee for new hole
+      ref.ballSpin    = null;
+      const cam = ref.holeObjects[nextIdx];
+      if (cam) {
+        ref.camera.position.copy(cam.camPos);
+        ref.camera.lookAt(cam.camTarget);
+        ref.controls.target.copy(cam.nearTarget);
+      } else {
+        ref.camera.position.set(ref.centre.x, ref.centre.y + ref.span * 0.5, ref.centre.z - ref.span * 0.9);
+        ref.controls.target.copy(ref.centre);
+      }
       if (ref.ballMesh) ref.ballMesh.visible = false;
     }
   }, [holeIndex, shotCount]);
@@ -564,6 +877,79 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
   const par         = currentHole?.par ?? "–";
   const totalHoles  = (courseJson?.holes || []).length;
 
+  // --- Aim change from minimap — updates azimuth state AND pivots camera ---
+  const handleAimChange = useCallback((az) => {
+    setAzimuth(az);
+    const ref = stateRef.current;
+    if (!ref || ref.followBall) return;
+    const azRad = az * Math.PI / 180;
+    const hi = ref._holeIndex ?? 0;
+
+    // Camera base: last ball pos (for subsequent shots) or tee
+    let camBase;
+    if (ref.lastBallPos) {
+      const terrY = ref.groundY
+        ? ref.groundY(ref.lastBallPos.x, ref.lastBallPos.z, ref.lastBallPos.y)
+        : ref.lastBallPos.y;
+      camBase = new THREE.Vector3(ref.lastBallPos.x, terrY + EYE_HEIGHT, ref.lastBallPos.z);
+    } else {
+      camBase = ref.holeObjects?.[hi]?.camPos;
+    }
+    if (!camBase) return;
+
+    const tx = camBase.x + (-Math.sin(azRad)) * 120;
+    const ty = camBase.y - 1.2;
+    const tz = camBase.z + ( Math.cos(azRad)) * 120;
+    ref.camera.position.copy(camBase);
+    ref.camera.lookAt(tx, ty, tz);
+    ref.controls.target.set(tx, ty, tz);
+    ref.controls.update();
+  }, []);
+
+  // --- Minimap data (derived from bounds + courseJson, updated per hole) ---
+  const minimapWorldBounds = useMemo(() => {
+    if (!bounds) return { minX: -500, maxX: 500, minZ: -500, maxZ: 500 };
+    const toXZ = makeToXZ(bounds);
+    const corners = [
+      toXZ(bounds.north, bounds.west), toXZ(bounds.north, bounds.east),
+      toXZ(bounds.south, bounds.west), toXZ(bounds.south, bounds.east),
+    ];
+    return {
+      minX: Math.min(...corners.map(c => c.x)),
+      maxX: Math.max(...corners.map(c => c.x)),
+      minZ: Math.min(...corners.map(c => c.z)),
+      maxZ: Math.max(...corners.map(c => c.z)),
+    };
+  }, [bounds]);
+
+  const minimapFeatures = useMemo(() => {
+    if (!courseJson || !bounds) return [];
+    const toXZ = makeToXZ(bounds);
+    const holeData = (courseJson.holes || [])[holeIndex];
+    if (!holeData) return [];
+    return (holeData.features || [])
+      .filter(f => f.points?.length >= 3)
+      .map(f => ({ type: f.type, points: f.points.map(p => toXZ(p.lat, p.lng)) }));
+  }, [courseJson, holeIndex, bounds]);
+
+  const minimapTeeXZ = useMemo(() => {
+    // Show current shot origin (ball's last resting spot) or fall back to the actual tee
+    if (shotOriginXZ) return shotOriginXZ;
+    if (!bounds) return { x: 0, z: 0 };
+    const toXZ = makeToXZ(bounds);
+    const hole = (courseJson?.holes || [])[holeIndex];
+    const teeM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "tee") || hole?.tee;
+    return teeM ? toXZ(teeM.lat, teeM.lng) : { x: 0, z: 0 };
+  }, [courseJson, holeIndex, bounds, shotOriginXZ]);
+
+  const minimapPinXZ = useMemo(() => {
+    if (!bounds) return null;
+    const toXZ = makeToXZ(bounds);
+    const hole = (courseJson?.holes || [])[holeIndex];
+    const pinM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "green") || hole?.green;
+    return pinM ? toXZ(pinM.lat, pinM.lng) : null;
+  }, [courseJson, holeIndex, bounds]);
+
   const panelStyle = {
     position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)",
     background: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)",
@@ -572,21 +958,74 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     fontSize: 13, userSelect: "none", zIndex: 10,
   };
 
-  const btnStyle = (color = "#2ecc71") => ({
+  const btn = (color = "#2ecc71") => ({
     background: color, border: "none", borderRadius: 8,
     color: "#fff", padding: "8px 18px", cursor: "pointer",
-    fontWeight: 700, fontSize: 14,
+    fontWeight: 700, fontSize: 14, fontFamily: "inherit",
   });
 
-  const sliderRow = (label, val, min, max, step, setter, unit = "") => (
+  const sliderRow = (label, val, min, max, step, setter, unit = "", extra = null) => (
     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-      <span style={{ width: 72, color: "#aaa" }}>{label}</span>
+      <span style={{ width: 76, color: "#aaa", fontSize: 12 }}>{label}</span>
       <input type="range" min={min} max={max} step={step} value={val}
-        onChange={e => setter(+e.target.value)}
-        style={{ flex: 1 }} />
-      <span style={{ width: 44, textAlign: "right" }}>{val}{unit}</span>
+        onChange={e => setter(+e.target.value)} style={{ flex: 1 }} />
+      <span style={{ width: 58, textAlign: "right", fontSize: 12 }}>{val}{unit}</span>
+      {extra && <span style={{ color: "#666", fontSize: 11 }}>{extra}</span>}
     </div>
   );
+
+  const speedMs = (ballSpeed * 0.44704).toFixed(0);
+  const spinLabel = sidespinRpm === 0 ? "Straight"
+    : sidespinRpm > 0 ? `Draw ${sidespinRpm}` : `Fade ${Math.abs(sidespinRpm)}`;
+
+  // ---------------------------------------------------------------------------
+  // Scoreboard helpers
+  // ---------------------------------------------------------------------------
+  const allHoles = courseJson?.holes || [];
+
+  // Build per-hole score data at the time of rendering.
+  // shots[i] is set when nextHole() is called (i.e. previous holes).
+  // The current hole score is shotCount.
+  const holeScores = allHoles.map((hole, idx) => {
+    const score = idx < holeIndex ? shots[idx]
+                : idx === holeIndex && status === "holed" ? shotCount
+                : null;
+    const toPar = score != null && hole.par ? score - hole.par : null;
+    return { hole, score, toPar };
+  });
+
+  const completedCount = holeIndex + (status === "holed" ? 1 : 0);
+  const totalPar       = holeScores.slice(0, completedCount).reduce((s, h) => s + (h.hole.par ?? 0), 0);
+  const totalScore     = holeScores.slice(0, completedCount).reduce((s, h) => s + (h.score ?? 0), 0);
+  const totalToPar     = totalScore - totalPar;
+
+  const scoreStyle = (toPar) => {
+    if (toPar == null) return { color: "#666" };
+    if (toPar <= -2)   return { color: "#f0c040", fontWeight: 700 };  // eagle+
+    if (toPar === -1)  return { color: "#2ecc71", fontWeight: 700 };  // birdie
+    if (toPar === 0)   return { color: "#58a6ff", fontWeight: 700 };  // par
+    if (toPar === 1)   return { color: "#e67e22", fontWeight: 600 };  // bogey
+    return                    { color: "#e74c3c", fontWeight: 600 };  // double+
+  };
+
+  const scoreName = (toPar, par) => {
+    if (toPar == null) return "–";
+    const score = toPar + par;
+    if (score === 1)   return toPar <= -2 ? "Condor" : "";  // hole-in-one on par 3 = birdie label below
+    if (toPar <= -3)   return "Albatross";
+    if (toPar === -2)  return "Eagle";
+    if (toPar === -1)  return "Birdie";
+    if (toPar === 0)   return "Par";
+    if (toPar === 1)   return "Bogey";
+    if (toPar === 2)   return "Double";
+    if (toPar === 3)   return "Triple";
+    return `+${toPar}`;
+  };
+
+  const toParStr = (n) => n > 0 ? `+${n}` : n === 0 ? "E" : `${n}`;
+
+  // Hole-in-one check
+  const hio = (h) => h.score === 1;
 
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "#000", display: "flex", flexDirection: "column" }}>
@@ -594,10 +1033,9 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
       {/* Header */}
       <div style={{
         display: "flex", alignItems: "center", gap: 16, padding: "8px 16px",
-        background: "rgba(0,0,0,0.8)", color: "#fff", flexShrink: 0, zIndex: 20,
-        fontSize: 13,
+        background: "rgba(0,0,0,0.8)", color: "#fff", flexShrink: 0, zIndex: 20, fontSize: 13,
       }}>
-        <button onClick={onClose} style={{ ...btnStyle("#e74c3c"), padding: "4px 10px", fontSize: 12 }}>✕ Exit</button>
+        <button onClick={onClose} style={{ ...btn("#e74c3c"), padding: "4px 10px", fontSize: 12 }}>← Exit</button>
         <strong style={{ fontSize: 15 }}>{courseName}</strong>
         {currentHole && (
           <>
@@ -609,38 +1047,150 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
         {distToPin !== null && status !== "holed" && (
           <span style={{ color: "#f1c40f" }}>📍 {distToPin} m to pin</span>
         )}
-        {status === "holed" && (
-          <span style={{ color: "#2ecc71", fontWeight: 700 }}>⛳ Holed!</span>
-        )}
-        <span style={{ marginLeft: "auto", color: wsStatus === "connected" ? "#2ecc71" : "#888" }}>
-          ⚡ Launch monitor: {wsStatus}
+        <span style={{ marginLeft: "auto", color: wsStatus === "connected" ? "#2ecc71" : "#555" }}>
+          ⚡ {wsStatus}
         </span>
       </div>
 
-      {/* 3D viewport */}
+      {/* Viewport */}
       <div ref={mountRef} style={{ flex: 1, minHeight: 0 }} />
 
-      {/* Shot panel — hidden while ball is flying */}
-      {status !== "flying" && (
+      {/* Shot panel — hidden while flying or when scoreboard is showing */}
+      {status !== "flying" && status !== "holed" && (
         <div style={panelStyle}>
-          {status === "holed" ? (
-            <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: 18, marginBottom: 8 }}>⛳ Holed in {shotCount}!</div>
-              {holeIndex + 1 < totalHoles
-                ? <button style={btnStyle()} onClick={nextHole}>Next Hole →</button>
-                : <div style={{ color: "#f1c40f" }}>Course complete!</div>
-              }
+          {sliderRow("Ball Speed", ballSpeed,   40, 220, 1,  setBallSpeed,   " mph", `${speedMs} m/s`)}
+          {sliderRow("Launch",     launchAngle,  2,  55, 1,  setLaunchAngle, "°")}
+          {sliderRow("Direction",  azimuth,    -90,  90, 1,  setAzimuth,     "°")}
+          {sliderRow("Backspin",   backspinRpm,  0, 9000, 50, setBackspinRpm, " rpm")}
+          {sliderRow("Side Spin",  sidespinRpm, -3000, 3000, 50, setSidespinRpm, " rpm")}
+          <button style={btn()} onClick={launchBall}>
+            🏌️ Hit · {ballSpeed} mph · {launchAngle}° · {spinLabel}
+          </button>
+          {stateRef.current?.lastBallPos && (
+            <div style={{ textAlign: "center", color: "#888", fontSize: 11 }}>
+              Hitting from resting spot — <button
+                onClick={() => { if (stateRef.current) stateRef.current.lastBallPos = null; setShotOriginXZ(null); }}
+                style={{ background: "none", border: "none", color: "#58a6ff", cursor: "pointer", fontSize: 11 }}
+              >return to tee</button>
             </div>
-          ) : (
-            <>
-              {sliderRow("Power",   power,   0, 100,  1, setPower,  "%")}
-              {sliderRow("Azimuth", azimuth, -90, 90,  1, setAzimuth, "°")}
-              {sliderRow("Loft",    loft,    5,  60,   1, setLoft,   "°")}
-              <button style={btnStyle()} onClick={launchBall}>
-                🏌️ Hit ({Math.round((power / 100) * MAX_POWER)} m/s · {loft}° · {azimuth > 0 ? azimuth + "°R" : azimuth < 0 ? Math.abs(azimuth) + "°L" : "Straight"})
-              </button>
-            </>
           )}
+        </div>
+      )}
+
+      {/* Scoreboard overlay — shown when a hole is holed */}
+      {status === "holed" && (
+        <div style={{
+          position: "absolute", inset: 0, zIndex: 30,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          background: "rgba(0,0,0,0.72)", backdropFilter: "blur(4px)",
+        }}>
+          <div style={{
+            background: "#0d1117",
+            border: "1px solid #30363d",
+            borderRadius: 14,
+            padding: "24px 28px",
+            minWidth: 420,
+            maxWidth: 600,
+            maxHeight: "80vh",
+            overflowY: "auto",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.8)",
+            fontFamily: "monospace",
+          }}>
+
+            {/* Header */}
+            <div style={{ textAlign: "center", marginBottom: 18 }}>
+              <div style={{ fontSize: 13, color: "#8b949e", letterSpacing: "0.12em", textTransform: "uppercase" }}>
+                {hio(holeScores[holeIndex]) ? "🏆 Hole in One!" : "⛳ Hole Complete"}
+              </div>
+              <div style={{ fontSize: 20, fontWeight: 700, color: "#e6edf3", marginTop: 4 }}>
+                {courseName}
+              </div>
+              <div style={{ fontSize: 13, color: "#8b949e", marginTop: 2 }}>
+                Hole {holeIndex + 1} of {totalHoles} · Par {currentHole?.par ?? "–"} · {shotCount} shot{shotCount !== 1 ? "s" : ""}
+                {holeScores[holeIndex].toPar != null && (
+                  <span style={{ marginLeft: 8, ...scoreStyle(holeScores[holeIndex].toPar) }}>
+                    ({scoreName(holeScores[holeIndex].toPar, currentHole?.par)})
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Scorecard table */}
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid #21262d", color: "#8b949e" }}>
+                  <th style={{ textAlign: "left",  padding: "5px 6px", fontWeight: 500 }}>Hole</th>
+                  <th style={{ textAlign: "right", padding: "5px 6px", fontWeight: 500 }}>Par</th>
+                  <th style={{ textAlign: "right", padding: "5px 6px", fontWeight: 500 }}>Yds</th>
+                  <th style={{ textAlign: "right", padding: "5px 6px", fontWeight: 500 }}>Score</th>
+                  <th style={{ textAlign: "right", padding: "5px 6px", fontWeight: 500 }}>+/−</th>
+                  <th style={{ textAlign: "left",  padding: "5px 6px", fontWeight: 500, paddingLeft: 10 }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {holeScores.map(({ hole, score, toPar }, idx) => {
+                  const isCurrent  = idx === holeIndex;
+                  const isFuture   = score == null;
+                  const rowBg      = isCurrent ? "rgba(46,204,113,0.08)" : "transparent";
+                  return (
+                    <tr key={hole.number} style={{
+                      background: rowBg,
+                      borderBottom: "1px solid #161b22",
+                      opacity: isFuture ? 0.38 : 1,
+                    }}>
+                      <td style={{ padding: "6px 6px", color: isCurrent ? "#2ecc71" : "#e6edf3", fontWeight: isCurrent ? 700 : 400 }}>
+                        {hole.number}
+                      </td>
+                      <td style={{ textAlign: "right", padding: "6px 6px", color: "#8b949e" }}>{hole.par ?? "–"}</td>
+                      <td style={{ textAlign: "right", padding: "6px 6px", color: "#8b949e" }}>{hole.yardage ?? "–"}</td>
+                      <td style={{ textAlign: "right", padding: "6px 6px", ...scoreStyle(toPar) }}>
+                        {score ?? "–"}
+                      </td>
+                      <td style={{ textAlign: "right", padding: "6px 6px", ...scoreStyle(toPar) }}>
+                        {toPar != null ? toParStr(toPar) : "–"}
+                      </td>
+                      <td style={{ textAlign: "left",  padding: "6px 6px", paddingLeft: 10, color: scoreStyle(toPar).color, fontSize: 11 }}>
+                        {hio({ score }) ? "Hole in One!" : (toPar != null ? scoreName(toPar, hole.par) : "")}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              {completedCount > 0 && (
+                <tfoot>
+                  <tr style={{ borderTop: "2px solid #30363d", fontWeight: 700 }}>
+                    <td style={{ padding: "8px 6px", color: "#e6edf3" }}>Total</td>
+                    <td style={{ textAlign: "right", padding: "8px 6px", color: "#8b949e" }}>{totalPar}</td>
+                    <td></td>
+                    <td style={{ textAlign: "right", padding: "8px 6px", color: "#e6edf3" }}>{totalScore}</td>
+                    <td style={{ textAlign: "right", padding: "8px 6px", ...scoreStyle(totalToPar) }}>
+                      {toParStr(totalToPar)}
+                    </td>
+                    <td></td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+
+            {/* Action buttons */}
+            <div style={{ display: "flex", gap: 10, marginTop: 20, justifyContent: "center" }}>
+              {holeIndex + 1 < totalHoles ? (
+                <button style={{ ...btn(), minWidth: 140 }} onClick={nextHole}>
+                  Next Hole →
+                </button>
+              ) : (
+                <>
+                  <div style={{ color: "#f1c40f", fontWeight: 700, fontSize: 15, alignSelf: "center" }}>
+                    Round Complete · {toParStr(totalToPar)}
+                  </div>
+                  <button style={{ ...btn("#e74c3c"), minWidth: 140 }} onClick={onClose}>
+                    Finish Round
+                  </button>
+                </>
+              )}
+            </div>
+
+          </div>
         </div>
       )}
 
@@ -648,6 +1198,20 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 18, pointerEvents: "none" }}>
           Building course…
         </div>
+      )}
+
+      {/* Minimap */}
+      {status !== "loading" && bounds && (
+        <Minimap
+          stateRef={stateRef}
+          teeXZ={minimapTeeXZ}
+          pinXZ={minimapPinXZ}
+          features={minimapFeatures}
+          worldBounds={minimapWorldBounds}
+          aimAzimuth={azimuth}
+          onAimChange={handleAimChange}
+          flipX={true}
+        />
       )}
     </div>
   );
