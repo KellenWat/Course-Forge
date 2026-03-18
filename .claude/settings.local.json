@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "Bash(cd:*)",
-      "Bash(where gh:*)"
+      "Bash(where gh:*)",
+      "WebSearch",
+      "WebFetch(domain:www.golf-simulators.com)",
+      "WebFetch(domain:www.math.union.edu)",
+      "WebFetch(domain:www.real-world-physics-problems.com)",
+      "WebFetch(domain:probablegolfinstruction.com)",
+      "WebFetch(domain:folk.uib.no)",
+      "WebFetch(domain:www.cambridge.org)",
+      "WebFetch(domain:www.physics.csbsju.edu)",
+      "WebFetch(domain:people.eng.unimelb.edu.au)",
+      "WebFetch(domain:www.ijimt.org)",
+      "WebFetch(domain:bcphysics.weebly.com)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "Bash(find:*)",
+      "Bash(grep:*)"
     ]
   }
 }

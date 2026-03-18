@@ -66,17 +66,31 @@ Three.js scene showing the terrain mesh with an ArcGIS satellite texture draped 
 - Tree models: `CylinderGeometry` trunk + `ConeGeometry` canopy, raycasted to terrain surface for ground placement
 - Badge shows `visible / total` tree count
 
+### Shared Ball Physics (`src/ballPhysics.js`)
+All physics constants and helpers shared between GameView and DrivingRange.
+
+**Key constants**: `GRAVITY`, `BALL_RADIUS_VIS` (0.3 m visual sphere), `BALL_RADIUS_PHYS` (0.02135 m, regulation 1.68" for Rapier collider), `BALL_MASS` (0.0459 kg), `K_DRAG` (2.1e-4), `K_MAGNUS` (4.2e-6), `SPIN_DECAY` (0.28/s).
+
+**`computeAeroForces(vel, vLen, inFlight, spin, dt)`** — returns `{Fx, Fy, Fz}`:
+- Drag: `F = -K_DRAG × |v| × v` (velocity-squared, always opposes motion)
+- Backspin lift: `Fy += K_MAGNUS × ω_back × hLen` (scales with horizontal speed)
+- Sidespin curve: `Fx += K_MAGNUS × ω_side × vzn × hLen` (also scales with speed — critical: `vzn` is a unit vector so `hLen` must be included explicitly)
+- Spin decays by `SPIN_DECAY × dt` fraction per frame
+
+**`SURFACE_ROLL`** — per-surface rolling physics used at DrivingRange landing handoff. Keyed by `'green' | 'fairway' | 'rough' | 'sand'`. Controls `ballFriction`, `restitution`, `linearDamping`, `angularDamping`. Green has low damping so backspin persists and can reverse the ball; rough has high damping so ball dies immediately.
+
+**`createRollingBody(rapierWorld, RAPIER, x, y, z, surfaceKey)`** — creates a Rapier body with surface-specific friction and damping for post-landing roll.
+
+**`applyLandingSpin(body, vel, spin)`** — sets Rapier angular velocity at landing to the actual flight spin values so Rapier's friction model produces natural check-up / spin-back. Backspin axis: `{x: -vzn × ω_back, y: ω_side, z: vxn × ω_back}` (perpendicular to direction of motion).
+
+**Rapier API note**: Use `rapierWorld.timestep = dt` to set the physics timestep — NOT `rapierWorld.integrationParameters.dt`, which is silently ignored in Rapier 0.19.
+
 ### Playable Game (`src/GameView.jsx`)
 Full-screen browser game mounted when the user clicks **▶ Play Course** in TerrainPreview. Requires `@dimforge/rapier3d-compat` (installed).
 
-**Physics**: Rapier3D WASM world with `GRAVITY = -9.81`. Terrain geometry is registered as a **trimesh collider** so the ball rolls on real elevation data. Ball is a dynamic rigid body (`ball radius 0.3 m` for visibility) with restitution 0.6, friction 0.4.
+**Physics**: Rapier3D WASM world (`rapierWorld.timestep = FIXED_DT`). Terrain geometry is a **trimesh collider** so the ball rolls on real elevation data. Ball uses `BALL_RADIUS_PHYS` (0.02135 m) for the Rapier collider and `BALL_RADIUS_VIS` (0.3 m) for the visual sphere. Aero forces computed via `computeAeroForces` and applied via `addForce` each frame; `stepPhysics` runs substeps to match real frame time.
 
-**Shot input**: Power (0–100% of 80 m/s max), Azimuth (−90°–+90°, 0 = north), Loft (5°–60°). Sliders in bottom panel. Launch velocity computed as:
-```
-vx = -sin(az) * cos(loft) * speed   // negated to match X pre-negation
-vy =  sin(loft) * speed
-vz =  cos(az)  * cos(loft) * speed
-```
+**Shot input**: Ball Speed (mph), Launch Angle, Azimuth (−90°–+90°, 0 = north), Backspin (rpm), Sidespin (rpm). Launch velocity via `computeLaunchVelocity(..., flipX=true)` — X is negated to match the pre-negated OBJ mesh coordinate system.
 
 **Camera**: follows ball during flight (lerp behind velocity vector), returns to `OrbitControls` when ball speed < 0.3 m/s.
 
@@ -89,6 +103,17 @@ vz =  cos(az)  * cos(loft) * speed
 **Launch monitor WebSocket**: connects to `ws://localhost:3001/launch-monitor`. Receives GSPro-format JSON (`BallSpeed`, `LaunchAngle`, `LaunchDirection`) and auto-fires a shot. The server relay (`wss` in `server.js`) bridges browser clients and launch monitor clients — launch monitor sends with header `x-client-type: launch-monitor`.
 
 **Flow**: TerrainPreview → **▶ Play Course** → `setGameActive(true)` → GameView mounts. **✕ Exit** → `setGameActive(false)` → back to TerrainPreview.
+
+### Driving Range (`src/DrivingRange.jsx`)
+Standalone practice range. Shot controls: Ball Speed (40–220 mph), Launch Angle (2–55°), Direction (±45°), Backspin (0–9000 rpm), Sidespin (±3000 rpm).
+
+**Physics architecture — two phases**:
+1. **Flight** (`ref.phase === 'flight'`): pure kinematic JS Euler integration — no Rapier. Each frame: `vel += (gravity + aeroForces/mass) × dt`, `pos += vel × dt`. Aero forces from `computeAeroForces`. This avoids all Rapier collision artifacts that previously caused the ball to reverse direction mid-flight.
+2. **Rolling** (`ref.phase === 'rolling'`): when `pos.y <= BALL_RADIUS_PHYS`, create a Rapier body via `createRollingBody` with surface-specific friction/damping, set `linvel` to the landing velocity, call `applyLandingSpin` to imprint spin as angular velocity, then step Rapier each frame. Ball stops when speed < 0.4 m/s.
+
+**Floor**: enormous cuboid (10 km half-extents) at y = −0.5 to 0 — edges are unreachable so collision normals are always straight up.
+
+**`ref.phase`** lifecycle: `null` → `'flight'` (on hit) → `'rolling'` (on ground contact) → `null` (on stop). `ref.ballBody` is `null` during flight and set only for the rolling Rapier body.
 
 ### Data Export
 - **JSON**: Full course data — hole metadata (par, handicap, notes), marker lat/lng positions, polygon feature geometries
@@ -107,6 +132,7 @@ Requires: Unity Terrain in scene, ≥2 TerrainLayers assigned (index 0 = rough, 
 - **Unity**: receives east=+X, elevation=+Y, north=+Z after its own X negation undoes the pre-negation
 
 ### Planned / Future
+- **GameView surface detection**: on ball landing, determine which drawn polygon (green, fairway, rough, bunker) contains the XZ position and pass the matching `SURFACE_ROLL` key to `createRollingBody`. Currently GameView uses default Rapier body without surface-specific rolling.
 - **Low-poly assets**: replace cone+cylinder trees with GLTF models via `GLTFLoader`. Kenney.nl Golf Kit (CC0) is a ready source. Drop GLTF files in `/public/assets/` and load with `GLTFLoader` in GameView.
 - **Community course sharing**: save course JSON to a database, expose `GET/POST /api/courses`, replace static `DEFAULT_COURSES` with live API. Terrain OBJ regenerated on demand from saved bounds.
-- **GSPro full integration**: map remaining GSPro shot data fields (spin, carry distance) into Rapier launch parameters.
+- **GLB fairway/rough border**: model a rough-to-fairway edge strip in Blender, export GLB, instance along polygon edges at course load time.

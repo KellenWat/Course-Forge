@@ -42,6 +42,7 @@ Three entry points from the landing page:
 - Select a target to highlight it and snap your aim
 - Shot tracer and landing distance in yards
 - **Minimap** with yardage ring overlay and click-to-aim
+- Full shot controls: ball speed (40–220 mph), launch angle, direction, backspin (0–9000 rpm), sidespin (±3000 rpm)
 
 ---
 
@@ -92,6 +93,7 @@ Course Forge/
     ├── HomeScreen.jsx        # Landing page
     ├── GameView.jsx          # In-browser course player (Three.js + Rapier)
     ├── DrivingRange.jsx      # Practice range (Three.js + Rapier)
+    ├── ballPhysics.js        # Shared ball physics constants, aero forces, Rapier helpers
     ├── Minimap.jsx           # Shared bird's-eye minimap (Canvas 2D, rAF loop)
     └── constants.js          # Tool modes, colors, labels
 ```
@@ -103,7 +105,9 @@ Course Forge/
 | Satellite map | Canvas 2D, Web Mercator projection, ArcGIS tile cache with broken-image eviction |
 | Elevation data | USGS 3DEP WCS → GeoTIFF parsed by `geotiff` → OBJ mesh |
 | 3D rendering | Three.js — terrain mesh, GLTF trees/flags, low-poly feature polygons |
-| Physics | `@dimforge/rapier3d-compat` — trimesh terrain collider, dynamic rigid body ball |
+| Ball flight | `ballPhysics.js` — kinematic Euler integration with drag, Magnus lift/curve, spin decay |
+| Ball rolling | `@dimforge/rapier3d-compat` — surface-aware bounce/roll with backspin check physics |
+| Physics (GameView) | Rapier trimesh terrain collider, full Rapier flight + rolling |
 | Minimap | Canvas 2D rAF loop reading Three.js scene refs directly — zero React state updates per frame |
 | Tree detection | Satellite pixel sampling — fairway green baseline, G/B ratio water exclusion |
 | Launch monitor | WebSocket relay (`/launch-monitor`) — GSPro JSON format auto-launches ball |
@@ -121,6 +125,30 @@ Payload: { "BallSpeed": 55, "LaunchAngle": 14, "LaunchDirection": -2 }
 ```
 
 The server relays shots to the browser in real time — the ball launches automatically on receipt.
+
+Spin fields (`SpinAxis`, `TotalSpin`) are mapped to backspin/sidespin and fed into the Magnus force model for realistic ball curve.
+
+---
+
+## Ball Physics
+
+Flight uses a kinematic Euler integration model (no physics engine during flight):
+
+- **Drag**: `F = -K_DRAG × |v| × v` (CD = 0.24 for dimpled ball)
+- **Magnus lift**: backspin produces vertical lift proportional to horizontal speed
+- **Magnus curve**: sidespin produces lateral force proportional to horizontal speed
+- **Spin decay**: ~28% per second aerodynamic torque loss in flight
+
+On landing, a Rapier rigid body is created with the ball's actual angular velocity (from spin) and surface-specific damping:
+
+| Surface | Linear damp | Angular damp | Spin-back? |
+|---------|-------------|--------------|------------|
+| Green | 0.4 | 0.6 | Yes — low damping lets backspin reverse the ball |
+| Fairway | 1.8 | 3.0 | Rarely — checks up, spin decays before reversing |
+| Rough | 5.5 | 7.0 | No — ball dies in the grass |
+| Sand | 12.0 | 10.0 | No — ball plugs |
+
+Surface constants live in `src/ballPhysics.js` (`SURFACE_ROLL`). GameView surface detection (green vs fairway vs rough) is a planned feature.
 
 ---
 
@@ -140,8 +168,10 @@ The server relays shots to the browser in real time — the ball launches automa
 
 ## Future Directions
 
+- **GameView surface detection** — detect whether the ball lands on green, fairway, rough, or bunker polygon and apply the correct `SURFACE_ROLL` physics automatically
 - **Community course sharing** — database + API so published courses appear for all users across IP addresses
 - **Unity export** — polished terrain import pipeline via `CourseForgeImporter.cs` for higher-fidelity course rendering, custom shaders, and advanced tree placement
 - **Curved polygon boundaries** — Catmull-Rom spline interpolation on drawn feature outlines
 - **Multiplayer scoring** — shared scorecards and live leaderboards
 - **Mobile support** — touch controls for map drawing and shot input
+- **Low-poly GLTF trees** — replace cone+cylinder trees with Kenney.nl Golf Kit (CC0) models

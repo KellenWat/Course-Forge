@@ -7,20 +7,10 @@ import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import RAPIER from "@dimforge/rapier3d-compat";
 import Minimap from "./Minimap.jsx";
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-const GRAVITY         = -9.81;
-const BALL_RADIUS_VIS = 0.3;
-const BALL_MASS       = 0.0459;
-
-// Magnus effect — same calibration as GameView
-const K_MAGNUS      = 4.2e-6;
-const SPIN_DECAY    = 0.22;
-const AIR_LIN_DAMP  = 0.008;
-const AIR_ANG_DAMP  = 0.06;
-const FLIGHT_THRESH = 0.5;   // m above ground to be "in flight"
+import {
+  GRAVITY, BALL_RADIUS_VIS, BALL_RADIUS_PHYS, BALL_MASS,
+  computeAeroForces, computeLaunchVelocity, createRollingBody, applyLandingSpin,
+} from "./ballPhysics.js";
 
 const YARDS_TO_M = 0.9144;
 const YARDAGES   = [50, 100, 150, 200, 250];
@@ -63,7 +53,6 @@ const RANGE_TARGETS    = YARDAGES.map(yd => ({
   color: "#" + YARDAGE_COLORS[yd].toString(16).padStart(6, "0"),
 }));
 
-const deg2rad = d => d * Math.PI / 180;
 
 const gltfLoader = new GLTFLoader();
 function loadGLTF(url) {
@@ -135,9 +124,14 @@ export default function DrivingRange({ onClose }) {
 
       // -- Physics --
       rapierWorld = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
-      // Flat ground collider at Y=0 (top surface)
+      rapierWorld.timestep = 1 / 60;
+      // Effectively-infinite flat ground — 10 km half-extents means the ball
+      // can never reach an edge and get a bad collision normal.
       rapierWorld.createCollider(
-        RAPIER.ColliderDesc.cuboid(150, 0.05, 400).setTranslation(0, -0.05, 200)
+        RAPIER.ColliderDesc.cuboid(10000, 0.5, 10000)
+          .setTranslation(0, -0.5, 0)
+          .setRestitution(0.1)
+          .setFriction(0.8)
       );
 
       // -- Renderer --
@@ -447,10 +441,13 @@ export default function DrivingRange({ onClose }) {
         landingMesh, targetMeshes,
         followBall: false,
         ballSpin: null,
+        // Kinematic flight state
+        phase: null,       // 'flight' | 'rolling' | null
+        flightPos: null,   // { x, y, z } mutated each frame
+        flightVel: null,   // { x, y, z } mutated each frame
       };
 
       // -- Animate --
-      const FIXED_DT = 1 / 120;
       let lastT = performance.now();
 
       const animate = () => {
@@ -463,48 +460,63 @@ export default function DrivingRange({ onClose }) {
         const ref = stateRef.current;
         if (!ref) return;
 
-        if (ref.ballBody) {
-          const vel  = ref.ballBody.linvel();
+        // ── FLIGHT: pure kinematic JS integration ────────────────────────────
+        if (ref.phase === 'flight' && ref.flightPos) {
+          const pos  = ref.flightPos;
+          const vel  = ref.flightVel;
           const vLen = Math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2);
-          const pos  = ref.ballBody.translation();
 
-          // Flight detection — flat range, ground at y=0
-          const inFlight = (pos.y - BALL_RADIUS_VIS) > FLIGHT_THRESH;
-          if (inFlight) {
-            ref.ballBody.setLinearDamping(AIR_LIN_DAMP);
-            ref.ballBody.setAngularDamping(AIR_ANG_DAMP);
-          } else {
-            // Fairway-like rolling on flat range
-            ref.ballBody.setLinearDamping(0.22);
-            ref.ballBody.setAngularDamping(0.55);
-          }
+          // Aero forces → accelerations
+          const { Fx, Fy, Fz } = computeAeroForces(vel, vLen, true, ref.ballSpin, dt);
+          vel.x += (Fx / BALL_MASS) * dt;
+          vel.y += (GRAVITY + Fy / BALL_MASS) * dt;
+          vel.z += (Fz / BALL_MASS) * dt;
+          pos.x += vel.x * dt;
+          pos.y += vel.y * dt;
+          pos.z += vel.z * dt;
 
-          // Magnus force
-          const spin = ref.ballSpin;
-          let Fx = 0, Fy = 0, Fz = 0;
-          if (spin && inFlight && vLen > 1) {
-            const hLen = Math.sqrt(vel.x ** 2 + vel.z ** 2);
-            if (hLen > 0.1) {
-              const vxn = vel.x / hLen, vzn = vel.z / hLen;
-              const ω_back = spin.backspin * (2 * Math.PI / 60);
-              const ωbx = -vzn * ω_back, ωbz = vxn * ω_back;
-              const ωy  = spin.sidespin * (2 * Math.PI / 60);
-              Fx = K_MAGNUS * (ωy * vel.z - ωbz * vel.y);
-              Fy = K_MAGNUS * (ωbz * vel.x - ωbx * vel.z);
-              Fz = K_MAGNUS * (ωbx * vel.y - ωy  * vel.x);
+          ref.ballMesh.position.set(pos.x, pos.y, pos.z);
+          ref.trailPoints.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+          if (ref.trailPoints.length > 400) ref.trailPoints.shift();
+          if (ref.trailPoints.length >= 2) {
+            const flat = new Float32Array(ref.trailPoints.length * 3);
+            for (let i = 0; i < ref.trailPoints.length; i++) {
+              flat[i * 3]     = ref.trailPoints[i].x;
+              flat[i * 3 + 1] = ref.trailPoints[i].y;
+              flat[i * 3 + 2] = ref.trailPoints[i].z;
             }
-            spin.backspin *= (1 - SPIN_DECAY * dt);
-            spin.sidespin *= (1 - SPIN_DECAY * dt);
+            ref.trailGeo.setPositions(flat);
+            ref.trailLine.visible = true;
           }
 
-          const steps = Math.round(dt / FIXED_DT);
-          for (let i = 0; i < steps; i++) {
-            if (Fx !== 0 || Fy !== 0 || Fz !== 0)
-              ref.ballBody.addForce({ x: Fx, y: Fy, z: Fz }, true);
-            ref.rapierWorld.step();
+          if (ref.followBall) {
+            ref.camera.position.lerp(
+              new THREE.Vector3(pos.x - vel.x * 0.15, pos.y + 4, pos.z - vel.z * 0.15), 0.04
+            );
+            ref.controls.target.lerp(new THREE.Vector3(pos.x, pos.y, pos.z), 0.12);
           }
 
-          const t = ref.ballBody.translation();
+          // Ground contact → hand off to Rapier for surface-aware bounce / roll
+          if (pos.y <= BALL_RADIUS_PHYS) {
+            pos.y = BALL_RADIUS_PHYS + 0.002;
+            // Surface key determines friction/damping (range = fairway-like)
+            const body = createRollingBody(ref.rapierWorld, RAPIER, pos.x, pos.y, pos.z, 'fairway');
+            body.setLinvel({ x: vel.x, y: vel.y, z: vel.z }, true);
+            // Imprint actual spin onto the Rapier body so friction produces
+            // natural check-up and spin-back behaviour
+            applyLandingSpin(body, vel, ref.ballSpin);
+            ref.ballBody = body;
+            ref.phase    = 'rolling';
+          }
+
+        // ── ROLLING: Rapier handles bounce / friction / roll-out ──────────────
+        } else if (ref.phase === 'rolling' && ref.ballBody) {
+          ref.rapierWorld.step();
+
+          const t     = ref.ballBody.translation();
+          const rvel  = ref.ballBody.linvel();
+          const speed = Math.sqrt(rvel.x ** 2 + rvel.y ** 2 + rvel.z ** 2);
+
           ref.ballMesh.position.set(t.x, t.y, t.z);
           ref.trailPoints.push(new THREE.Vector3(t.x, t.y, t.z));
           if (ref.trailPoints.length > 400) ref.trailPoints.shift();
@@ -520,27 +532,25 @@ export default function DrivingRange({ onClose }) {
           }
 
           if (ref.followBall) {
-            const vel   = ref.ballBody.linvel();
-            const speed = Math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2);
             ref.camera.position.lerp(
-              new THREE.Vector3(t.x - vel.x * 0.15, t.y + 4, t.z - vel.z * 0.15), 0.04
+              new THREE.Vector3(t.x - rvel.x * 0.15, t.y + 4, t.z - rvel.z * 0.15), 0.04
             );
             ref.controls.target.lerp(new THREE.Vector3(t.x, t.y, t.z), 0.12);
 
-            if (speed < 0.4 || t.y < -10) {
+            if (speed < 0.4 || t.y < -5) {
               ref.followBall = false;
-              ref.ballBody   = null;
+              ref.rapierWorld.removeRigidBody(ref.ballBody);
+              ref.ballBody = null;
+              ref.phase    = null;
 
-              // Show landing marker
+              // Show landing marker at rest position
               ref.landingMesh.position.set(t.x, Math.max(t.y, 0) + 0.4, t.z);
               ref.landingMesh.visible = true;
 
-              // Compute distance in yards
               const distM  = Math.sqrt(t.x ** 2 + t.z ** 2);
               const distYd = distM / YARDS_TO_M;
               setLastLanding({ yds: Math.round(distYd), x: t.x.toFixed(1), z: t.z.toFixed(1) });
 
-              // Return camera to tee first-person
               ref.camera.position.set(0, 1.8, -3);
               ref.controls.target.set(0, 1.5, 120);
               setStatus("ready");
@@ -561,6 +571,7 @@ export default function DrivingRange({ onClose }) {
         stateRef.current.renderer.setSize(w, h);
         stateRef.current.camera.aspect = w / h;
         stateRef.current.camera.updateProjectionMatrix();
+        stateRef.current.trailMat.resolution.set(w, h);
       };
       window.addEventListener("resize", onResize);
       stateRef.current._cleanup = () => window.removeEventListener("resize", onResize);
@@ -636,6 +647,7 @@ export default function DrivingRange({ onClose }) {
     const ref = stateRef.current;
     if (!ref || !ref.rapierWorld) return;
 
+    // Clean up any Rapier body left from a previous rolling phase
     if (ref.ballBody) {
       ref.rapierWorld.removeRigidBody(ref.ballBody);
       ref.ballBody = null;
@@ -644,27 +656,15 @@ export default function DrivingRange({ onClose }) {
     // Hide landing marker from last shot
     ref.landingMesh.visible = false;
 
-    const startY   = BALL_RADIUS_VIS + 0.05;
-    const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(0, startY, 0)
-      .setLinearDamping(AIR_LIN_DAMP)
-      .setAngularDamping(AIR_ANG_DAMP);
-    const body = ref.rapierWorld.createRigidBody(bodyDesc);
-    ref.rapierWorld.createCollider(
-      RAPIER.ColliderDesc.ball(BALL_RADIUS_VIS).setRestitution(0.55).setFriction(0.35).setMass(BALL_MASS),
-      body
-    );
+    const startY = BALL_RADIUS_PHYS + 0.1;
+    const { vx, vy, vz } = computeLaunchVelocity(ballSpeed, launchAngle, azimuth, false);
 
-    const speedMs  = ballSpeed * 0.44704;
-    const loftRad  = deg2rad(launchAngle);
-    const azRad    = deg2rad(azimuth);
-    const vx =  Math.sin(azRad) * Math.cos(loftRad) * speedMs; // +az = right (no X flip in range)
-    const vy =  Math.sin(loftRad) * speedMs;
-    const vz =  Math.cos(azRad)   * Math.cos(loftRad) * speedMs;
-    body.setLinvel({ x: vx, y: vy, z: vz }, true);
+    // Kinematic flight — no Rapier body yet
+    ref.flightPos = { x: 0, y: startY, z: 0 };
+    ref.flightVel = { x: vx, y: vy, z: vz };
+    ref.ballSpin  = { backspin: backspinRpm, sidespin: sidespinRpm };
+    ref.phase     = 'flight';
 
-    ref.ballSpin = { backspin: backspinRpm, sidespin: sidespinRpm };
-    ref.ballBody = body;
     ref.ballMesh.visible = true;
     ref.ballMesh.position.set(0, startY, 0);
     ref.trailPoints.length = 0;
@@ -791,11 +791,13 @@ export default function DrivingRange({ onClose }) {
       {/* Shot panel */}
       {status !== "flying" && (
         <div style={panelStyle}>
-          {sliderRow("Power",   power,   0, 100, 1, setPower,  "%")}
-          {sliderRow("Aim",     azimuth, -45, 45, 1, setAzimuth, "°")}
-          {sliderRow("Loft",    loft,    5, 60,  1, setLoft,   "°")}
+          {sliderRow("Ball Speed",  ballSpeed,    40, 220,   1,  setBallSpeed,   " mph")}
+          {sliderRow("Launch",      launchAngle,   2,  55,   1,  setLaunchAngle, "°")}
+          {sliderRow("Direction",   azimuth,      -45, 45,   1,  setAzimuth,     "°")}
+          {sliderRow("Backspin",    backspinRpm,    0, 9000, 50, setBackspinRpm, " rpm")}
+          {sliderRow("Side Spin",   sidespinRpm, -3000, 3000, 50, setSidespinRpm, " rpm")}
           <button style={btn()} onClick={launchBall}>
-            🏌️ Hit ({Math.round((power / 100) * MAX_POWER)} m/s · {loft}° · {azimuth > 0 ? azimuth + "°R" : azimuth < 0 ? Math.abs(azimuth) + "°L" : "Straight"})
+            🏌️ Hit ({(ballSpeed * 0.44704).toFixed(0)} m/s · {launchAngle}° · {azimuth > 0 ? azimuth + "°R" : azimuth < 0 ? Math.abs(azimuth) + "°L" : "Straight"})
           </button>
         </div>
       )}

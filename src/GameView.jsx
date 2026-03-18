@@ -8,32 +8,53 @@ import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
 import RAPIER from "@dimforge/rapier3d-compat";
 import Minimap from "./Minimap.jsx";
+import {
+  GRAVITY, BALL_RADIUS_VIS, BALL_RADIUS_PHYS, BALL_MASS, FIXED_DT,
+  AIR_LIN_DAMP, AIR_ANG_DAMP, FLIGHT_THRESH,
+  computeAeroForces, stepPhysics, computeLaunchVelocity, createBallBody,
+} from "./ballPhysics.js";
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants (GameView-specific)
 // ---------------------------------------------------------------------------
-const GRAVITY         = -9.81;
-const BALL_RADIUS_VIS = 0.3;
-const BALL_MASS       = 0.0459;
-const HOLE_RADIUS     = 0.54;   // metres — if ball within this on landing, it's holed
-const EYE_HEIGHT      = 1.8;    // first-person camera height in metres
-
-// Magnus lift constant: F = K_MAGNUS * (ω × v), calibrated for a real golf ball
-// Derived from 2π·ρ·r³·Cm/m with r=0.02135m, ρ=1.225, Cm=0.5, m=0.0459
-const K_MAGNUS       = 4.2e-6;   // kg·s/m  (gives ~2 m/s² lift at 3000rpm, 70 m/s)
-const SPIN_DECAY     = 0.22;     // fraction of spin lost per second while airborne
-const AIR_LIN_DAMP   = 0.008;   // linear damping in flight (air resistance)
-const AIR_ANG_DAMP   = 0.06;    // angular damping in flight
-const FLIGHT_THRESH  = 0.5;     // m above terrain surface to be considered "in flight"
+const HOLE_RADIUS = 0.54;   // metres — if ball within this on landing, it's holed
+const EYE_HEIGHT  = 1.8;    // first-person camera height in metres
 
 // Low-poly feature colours (Three.js hex)
 const FEATURE_COLORS = {
-  fairway:    0x5aaa4a,
-  green_area: 0x3d9e36,
-  bunker:     0xe8d59a,
-  water:      0x3a7bd5,
-  path:       0xb0b8c0,
-  rough:      0x3a6b2a,
+  fairway:    0x4fa83d,
+  green_area: 0x2e9e28,
+  bunker:     0xd4b97a,
+  water:      0x2e6bbf,
+  path:       0xa8b0b8,
+  rough:      0x2d5a1e,
+};
+
+// Edge/border colour drawn around fairway + green to show the mow line
+const FEATURE_EDGE_COLORS = {
+  fairway:    0x3d8c2e,
+  green_area: 0x1e7a1e,
+};
+
+// Y offset above terrain per surface type (metres)
+// Positive = raised above rough baseline, negative = sunken
+const FEATURE_Y_OFFSET = {
+  rough:      0.00,
+  path:       0.04,
+  fairway:    0.10,  // raised above rough — shows the tighter mow height
+  green_area: 0.16,  // highest — very flat, slightly elevated
+  bunker:    -0.05,  // sunken below surrounding grade
+  water:      0.02,
+};
+
+// PBR material properties [roughness, metalness, opacity]
+const FEATURE_MAT = {
+  rough:      [0.95, 0.0, 0.96],
+  fairway:    [0.80, 0.0, 0.97],
+  green_area: [0.65, 0.0, 0.98],
+  bunker:     [0.90, 0.0, 0.98],
+  water:      [0.15, 0.1, 0.82],
+  path:       [0.85, 0.0, 0.97],
 };
 
 // Overlay render order — higher = renders on top
@@ -102,8 +123,6 @@ function makeToXZ(bounds) {
   });
 }
 
-const deg2rad = d => d * Math.PI / 180;
-
 // Three.js raycaster used for terrain height queries (immune to Rapier winding issues).
 const _hRaycaster = new THREE.Raycaster();
 _hRaycaster.firstHitOnly = true;
@@ -145,6 +164,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
       if (destroyed) return;
 
       rapierWorld = new RAPIER.World({ x: 0, y: GRAVITY, z: 0 });
+      rapierWorld.timestep = FIXED_DT;
 
       // -- Renderer --
       const w = mountRef.current.clientWidth;
@@ -187,7 +207,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
       terrainObj.traverse(child => {
         if (!(child instanceof THREE.Mesh)) return;
         child.receiveShadow = true;
-        child.material = new THREE.MeshLambertMaterial({ color: FEATURE_COLORS.rough, side: THREE.DoubleSide });
+        child.material = new THREE.MeshStandardMaterial({ color: FEATURE_COLORS.rough, roughness: 0.95, metalness: 0, side: THREE.DoubleSide });
         terrainMeshes.push(child);
         box.expandByObject(child);
       });
@@ -388,16 +408,16 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
           for (let x = minX - step; x <= maxX + step; x += step) xs.push(x);
           for (let z = minZ - step; z <= maxZ + step; z += step) zs.push(z);
 
+          const yOff = FEATURE_Y_OFFSET[feat.type] ?? 0.05;
           const positions = [];
           const gridIdx   = new Map();
           for (let zi = 0; zi < zs.length; zi++) {
             for (let xi = 0; xi < xs.length; xi++) {
               const x = xs[xi], z = zs[zi];
               if (!pip(x, z, pts2d)) continue;
-              // Use centre.y as fallback so edge points still get placed
               const gy = groundY(x, z, centre.y);
               gridIdx.set(`${xi},${zi}`, positions.length / 3);
-              positions.push(x, gy + 0.05, z);
+              positions.push(x, gy + yOff, z);
             }
           }
           if (positions.length === 0) continue;
@@ -422,11 +442,14 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
           geo.setIndex(triIdx);
           geo.computeVertexNormals();
 
-          const mat = new THREE.MeshLambertMaterial({
+          const [matRoughness, matMetal, matOpacity] = FEATURE_MAT[feat.type] ?? [0.9, 0, 0.95];
+          const mat = new THREE.MeshStandardMaterial({
             color,
+            roughness: matRoughness,
+            metalness: matMetal,
             side: THREE.DoubleSide,
             transparent: true,
-            opacity: feat.type === "water" ? 0.85 : 0.93,
+            opacity: matOpacity,
             polygonOffset: true,
             polygonOffsetFactor: -4,
             polygonOffsetUnits: -4,
@@ -435,6 +458,26 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
           const mesh = new THREE.Mesh(geo, mat);
           mesh.renderOrder = FEATURE_Z_ORDER[feat.type] ?? 1;
           scene.add(mesh);
+
+          // Edge border line around fairway / green to mark the mow-cut boundary
+          if (FEATURE_EDGE_COLORS[feat.type]) {
+            const edgePts = pts2d.map(p => {
+              const gy = groundY(p.x, p.z, centre.y);
+              return new THREE.Vector3(p.x, gy + yOff + 0.02, p.z);
+            });
+            // Close the loop
+            edgePts.push(edgePts[0].clone());
+            const edgeGeo = new THREE.BufferGeometry().setFromPoints(edgePts);
+            const edgeMat = new THREE.LineBasicMaterial({
+              color: FEATURE_EDGE_COLORS[feat.type],
+              transparent: true,
+              opacity: 0.7,
+              depthWrite: false,
+            });
+            const edgeLine = new THREE.Line(edgeGeo, edgeMat);
+            edgeLine.renderOrder = (FEATURE_Z_ORDER[feat.type] ?? 1) + 0.5;
+            scene.add(edgeLine);
+          }
         }
       }
 
@@ -509,7 +552,6 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
       };
 
       // -- Animate --
-      const FIXED_DT = 1 / 120;
       let lastT = performance.now();
 
       const animate = () => {
@@ -549,7 +591,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
           const terrY = ref.groundY
             ? ref.groundY(t_pre.x, t_pre.z, t_pre.y - BALL_RADIUS_VIS)
             : (t_pre.y - BALL_RADIUS_VIS);
-          const inFlight = (t_pre.y - terrY - BALL_RADIUS_VIS) > FLIGHT_THRESH;
+          const inFlight = (t_pre.y - terrY - BALL_RADIUS_PHYS) > FLIGHT_THRESH;
 
           if (inFlight) {
             ref.ballBody.setLinearDamping(AIR_LIN_DAMP);
@@ -560,37 +602,9 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
             ref.ballBody.setAngularDamping(ad);
           }
 
-          // --- Magnus force (backspin lift + sidespin draw/fade) ---
-          const spin = ref.ballSpin;
-          if (spin && inFlight && vLen > 1) {
-            const hLen = Math.sqrt(vel.x ** 2 + vel.z ** 2);
-            let Fx = 0, Fy = 0, Fz = 0;
-            if (hLen > 0.1) {
-              const vxn = vel.x / hLen, vzn = vel.z / hLen;
-              // Backspin angular velocity axis = -normalize(worldUp × vDir)
-              // For flight along vDir, backspin ω = backspin_rad * (-vzn, 0, vxn)
-              const ω_back = spin.backspin * (2 * Math.PI / 60);
-              const ωbx = -vzn * ω_back, ωbz = vxn * ω_back;
-              // Sidespin: ω around Y axis (+ = draw/left, - = fade/right)
-              const ωy = spin.sidespin * (2 * Math.PI / 60);
-              // Magnus: F = K_MAGNUS * (ω × v), applied as force in Newtons (×mass inside K)
-              Fx = K_MAGNUS * (ωy * vel.z - ωbz * vel.y);
-              Fy = K_MAGNUS * (ωbz * vel.x - ωbx * vel.z);
-              Fz = K_MAGNUS * (ωbx * vel.y - ωy * vel.x);
-            }
-            // Spin decay
-            spin.backspin *= (1 - SPIN_DECAY * dt);
-            spin.sidespin *= (1 - SPIN_DECAY * dt);
-            // Apply force each sub-step
-            const steps = Math.round(dt / FIXED_DT);
-            for (let i = 0; i < steps; i++) {
-              ref.ballBody.addForce({ x: Fx, y: Fy, z: Fz }, true);
-              ref.rapierWorld.step();
-            }
-          } else {
-            const steps = Math.round(dt / FIXED_DT);
-            for (let i = 0; i < steps; i++) ref.rapierWorld.step();
-          }
+          // --- Aerodynamic forces (drag + Magnus) — applied only in flight ---
+          const { Fx, Fy, Fz } = computeAeroForces(vel, vLen, inFlight, ref.ballSpin, dt);
+          stepPhysics(ref.ballBody, ref.rapierWorld, Fx, Fy, Fz, dt);
 
           const t = ref.ballBody.translation();
           ref.ballMesh.position.set(t.x, t.y, t.z);
@@ -619,6 +633,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
 
             if (speed < 0.3) {
               ref.followBall  = false;
+              ref.rapierWorld.removeRigidBody(ref.ballBody);
               ref.ballBody    = null;
               ref.lastBallPos = { x: t.x, y: t.y, z: t.z };
               setStatus("ready");
@@ -723,29 +738,10 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     }
 
     const gy     = ref.groundY ? ref.groundY(startX, startZ, ref.centre.y) : ref.centre.y;
-    const startY = gy + BALL_RADIUS_VIS + 0.05;
+    const startY = gy + BALL_RADIUS_PHYS + 0.005;
 
-    const bodyDesc = RAPIER.RigidBodyDesc.dynamic()
-      .setTranslation(startX, startY, startZ)
-      .setLinearDamping(AIR_LIN_DAMP)
-      .setAngularDamping(AIR_ANG_DAMP)
-      .setCcdEnabled(true);
-    const body = ref.rapierWorld.createRigidBody(bodyDesc);
-    ref.rapierWorld.createCollider(
-      RAPIER.ColliderDesc.ball(BALL_RADIUS_VIS)
-        .setRestitution(0.55)
-        .setFriction(0.35)
-        .setMass(BALL_MASS),
-      body
-    );
-
-    // Ball speed: mph → m/s
-    const speedMs  = ballSpeed * 0.44704;
-    const loftRad  = deg2rad(launchAngle);
-    const azRad    = deg2rad(azimuth);
-    const vx = -Math.sin(azRad) * Math.cos(loftRad) * speedMs;
-    const vy =  Math.sin(loftRad) * speedMs;
-    const vz =  Math.cos(azRad)   * Math.cos(loftRad) * speedMs;
+    const body = createBallBody(ref.rapierWorld, RAPIER, startX, startY, startZ);
+    const { vx, vy, vz } = computeLaunchVelocity(ballSpeed, launchAngle, azimuth, true);
     body.setLinvel({ x: vx, y: vy, z: vz }, true);
 
     // Store spin for Magnus effect application during flight
@@ -813,7 +809,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     const toXZ = makeToXZ(bounds);
     const hole = (courseJson?.holes || [])[holeIndex];
     const teeM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "tee") || hole?.tee;
-    const pinM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "green") || hole?.green;
+    const pinM = (courseJson?.markers || []).find(m => Number(m.hole) === Number(hole?.number) && m.type === "green") || hole?.green;
     if (!teeM || !pinM) return;
     const tee = toXZ(teeM.lat, teeM.lng);
     const pin = toXZ(pinM.lat, pinM.lng);
@@ -938,7 +934,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     if (!bounds) return { x: 0, z: 0 };
     const toXZ = makeToXZ(bounds);
     const hole = (courseJson?.holes || [])[holeIndex];
-    const teeM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "tee") || hole?.tee;
+    const teeM = (courseJson?.markers || []).find(m => Number(m.hole) === Number(hole?.number) && m.type === "tee") || hole?.tee;
     return teeM ? toXZ(teeM.lat, teeM.lng) : { x: 0, z: 0 };
   }, [courseJson, holeIndex, bounds, shotOriginXZ]);
 
@@ -946,7 +942,7 @@ export default function GameView({ objText, bounds, courseJson, courseName, tree
     if (!bounds) return null;
     const toXZ = makeToXZ(bounds);
     const hole = (courseJson?.holes || [])[holeIndex];
-    const pinM = (courseJson?.markers || []).find(m => m.hole === hole?.number && m.type === "green") || hole?.green;
+    const pinM = (courseJson?.markers || []).find(m => Number(m.hole) === Number(hole?.number) && m.type === "green") || hole?.green;
     return pinM ? toXZ(pinM.lat, pinM.lng) : null;
   }, [courseJson, holeIndex, bounds]);
 
